@@ -1,0 +1,873 @@
+From 555c70b7b372b391e0ece37ff657cbcd8a725a3f Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Johan=20Sellstr=C3=B6m?= <johan.sellstrom@iproov.com>
+Date: Fri, 2 Oct 2026 10:02:43 +0100
+Subject: [PATCH] Propose NFCIsoDepReader: ISO-DEP access to eMRTD identity
+ documents
+
+Adds an NFCIsoDepReader / NFCIsoDepTag API restricted by UA-enforced
+application policies. The only policy defined is for ICAO Doc 9303 eMRTDs:
+the UA classifies a card before exposing it and filters plaintext command
+APDUs so that only the eMRTD application can be selected. Also adds
+terminology, a use case, an example, threats and security policies, and
+hooks into visibility handling and release of NFC.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ index.html | 764 ++++++++++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 763 insertions(+), 1 deletion(-)
+
+diff --git a/index.html b/index.html
+index 96abed7..cf24227 100644
+--- a/index.html
++++ b/index.html
+@@ -111,6 +111,30 @@
+           publisher: "NFC Forum",
+           date: "16 January 2014",
+         },
++        "ICAO-9303": {
++          href: "https://www.icao.int/publications/pages/publication.aspx?docnum=9303",
++          title: "Doc 9303: Machine Readable Travel Documents, Eighth Edition",
++          publisher: "International Civil Aviation Organization",
++          date: "2021",
++        },
++        "ISO7816-4": {
++          href: "https://www.iso.org/standard/77180.html",
++          title: "ISO/IEC 7816-4: Identification cards — Integrated circuit cards — Part 4: Organization, security and commands for interchange",
++          publisher: "ISO/IEC",
++          date: "2020",
++        },
++        "ISO14443-4": {
++          href: "https://www.iso.org/standard/73599.html",
++          title: "ISO/IEC 14443-4: Cards and security devices for personal identification — Contactless proximity objects — Part 4: Transmission protocol",
++          publisher: "ISO/IEC",
++          date: "2018",
++        },
++        "BSI-TR-03110": {
++          href: "https://www.bsi.bund.de/EN/Themen/Unternehmen-und-Organisationen/Standards-und-Zertifizierung/Technische-Richtlinien/TR-nach-Thema-sortiert/tr03110/tr-03110.html",
++          title: "Technical Guideline TR-03110: Advanced Security Mechanisms for Machine Readable Travel Documents and eIDAS Token",
++          publisher: "Bundesamt für Sicherheit in der Informationstechnik",
++          date: "2015",
++        },
+         "ISO-639.2": {
+           href: "https://www.loc.gov/standards/iso639-2/php/code_list.php",
+           title: "Codes for the Representation of Names of Languages",
+@@ -149,7 +173,11 @@
+   </p>
+   <p class="advisement">
+     Low-level I/O operations (e.g. ISO-DEP, NFC-A/B, NFC-F) and Host-based Card
+-    Emulation (HCE) are <b>not</b> supported within the current scope.
++    Emulation (HCE) are <b>not</b> supported within the current scope, with one
++    proposed exception: exchanging <a>command APDU</a>s with
++    <a>electronic machine readable travel documents</a> over <a>ISO-DEP</a>,
++    restricted by a UA-enforced <a>application policy</a>. See
++    [[[#the-nfcisodepreader-object]]].
+   </p>
+ </section>
+ 
+@@ -260,6 +288,38 @@
+     The term <dfn>NFC content</dfn> denotes all bytes sent to or received from
+     an <a>NFC tag</a>. In the current API it is synonym to <a>NDEF message</a>.
+   </p>
++  <p>
++    <dfn>ISO-DEP</dfn> is the half-duplex block transmission protocol defined
++    in [[!ISO14443-4]], used by contactless smart cards on top of NFC-A or
++    NFC-B.
++  </p>
++  <p>
++    A <dfn>command APDU</dfn> is an application protocol data unit sent to a
++    smart card, consisting of a class byte (<dfn>CLA</dfn>), an instruction
++    byte (<dfn>INS</dfn>), two parameter bytes (<dfn>P1</dfn> and
++    <dfn>P2</dfn>), and optional command data and expected response length,
++    as defined in [[!ISO7816-4]]. A <dfn>response APDU</dfn> is the card's
++    answer, ending with two status bytes. The status bytes `90 00` indicate
++    success.
++  </p>
++  <p>
++    An <dfn>application identifier</dfn> (AID) identifies an application on a
++    smart card, and is used to select it with the <code>SELECT</code> command
++    ([[!ISO7816-4]]).
++  </p>
++  <p>
++    An <dfn data-lt="electronic machine readable travel documents|eMRTD">electronic
++    machine readable travel document</dfn> (eMRTD) is a passport, identity card
++    or other travel document containing a contactless chip that follows
++    [[!ICAO-9303]]. Access to the chip's data requires an access key derived
++    from the document's machine readable zone (MRZ) or card access number
++    (CAN), using Basic Access Control (BAC) or Password Authenticated
++    Connection Establishment (PACE).
++  </p>
++  <p>
++    The <dfn>eMRTD application identifier</dfn> is the byte sequence
++    `A0 00 00 02 47 10 01`.
++  </p>
+ </section> <!-- Terminology -->
+ 
+ 
+@@ -348,6 +408,24 @@
+     </p>
+   </section>
+ 
++  <section class="informative"> <h3>ISO-DEP and identity documents</h3>
++    <p>
++      Many smart cards, including payment cards, transit cards, access badges
++      and <a>eMRTD</a>s, do not store an <a>NDEF message</a>. They run one or
++      more card applications that are addressed with <a>command APDU</a>s over
++      <a>ISO-DEP</a>. Such cards are not readable through {{NDEFReader}}.
++    </p>
++    <p>
++      <a>eMRTD</a>s are of particular interest to the web: their data is
++      signed by the issuing state (passive authentication), and the chip can
++      prove that it is genuine (active authentication or chip authentication).
++      Reading the chip is therefore one of the strongest forms of remote
++      identity proofing available on a phone. Unlike generic smart cards, an
++      <a>eMRTD</a> reveals no personal data until the reader proves knowledge
++      of an access key printed on the document.
++    </p>
++  </section>
++
+   <section>
+   <h3>
+     The NDEF record and fields
+@@ -935,6 +1013,15 @@
+     </p>
+   </section>
+ 
++  <section> <h3>Reading an identity document</h3>
++    <p>
++      A web page asks the user to hold their passport or identity card to the
++      device, for instance to onboard to a digital identity wallet or to open
++      an account. The page reads the document's chip and verifies the issuing
++      state's signatures, without the user installing an application.
++    </p>
++  </section>
++
+   <section> <h3>Support for multiple NFC adapters</h3>
+     <p>
+       Users may attach one or more external <a>NFC adapter</a>s to their
+@@ -987,6 +1074,41 @@
+     </pre>
+   </section>
+ 
++  <section><h3>Select the application on an identity document</h3>
++    <p>
++      An {{NFCIsoDepReader}} exposes an <a>eMRTD</a> as an {{NFCIsoDepTag}}.
++      The page exchanges <a>command APDU</a>s with it. This example selects
++      the eMRTD application and checks the status bytes of the response.
++      Reading the document's data additionally requires the access control,
++      secure messaging and authentication steps defined in [[ICAO-9303]],
++      which are outside the scope of this specification.
++    </p>
++    <pre class="example">
++      const SELECT_EMRTD = new Uint8Array([
++        0x00, 0xA4, 0x04, 0x0C, 0x07,
++        0xA0, 0x00, 0x00, 0x02, 0x47, 0x10, 0x01
++      ]);
++
++      const reader = new NFCIsoDepReader();
++      reader.onreading = async ({ tag }) => {
++        const response = await tag.transceive(SELECT_EMRTD);
++        const sw = response.slice(-2);
++        if (sw[0] === 0x90 &amp;&amp; sw[1] === 0x00) {
++          console.log("eMRTD application selected.");
++        }
++        await tag.close();
++      };
++      reader.onreadingerror = () => {
++        console.log("This card is not an identity document.");
++      };
++
++      button.onclick = async () => {
++        await reader.scan({ applications: ["emrtd"] });
++        console.log("Hold your passport to the back of the phone.");
++      };
++    </pre>
++  </section>
++
+   <section><h3>General information about writing data</h3>
+     <p>
+       Writing data is generally straightforward, but there are a few
+@@ -2233,6 +2355,9 @@
+           <li>
+             Attempt to <a>abort a pending make read-only operation</a>.
+           </li>
++          <li>
++            <a>Close the active ISO-DEP session</a>.
++          </li>
+         </ol>
+       </li>
+     </ol>
+@@ -2307,6 +2432,12 @@
+     <li>
+       Clear the <a>activated reader objects</a>.
+     </li>
++    <li>
++      <a>Close the active ISO-DEP session</a>.
++    </li>
++    <li>
++      Clear the <a>activated ISO-DEP reader objects</a>.
++    </li>
+     <li>
+       Release the NFC resources on the underlying platform.
+     </li>
+@@ -3745,6 +3876,11 @@
+       <li>
+         If <a>NFC is suspended</a>, abort these steps.
+       </li>
++      <li>
++        If the <a>NFC tag</a> in proximity range does not expose <a>NDEF</a>
++        technology for reading or formatting, and it was claimed by the
++        <a>NFC ISO-DEP reading algorithm</a>, abort these steps.
++      </li>
+       <li>
+         If the <a>NFC tag</a> in proximity range does not expose <a>NDEF</a>
+         technology for reading or formatting, run the following sub-steps:
+@@ -4514,6 +4650,555 @@
+ </section>
+ 
+ <!-- - - - - - - - - - - - - - - The Blocklist - - - - - - - - - - - - - - - -->
++<!-- - - - - - - - - - - - - - - NFCIsoDepReader - - - - - - - - - - - - - - -->
++<section id="the-nfcisodepreader-object" data-dfn-for="NFCIsoDepReader" data-link-for="NFCIsoDepReader">
++  <h2>The NFCIsoDepReader object</h2>
++  <div class="ednote">
++    This section is a proposed addition to Web NFC (ISO-DEP access to
++    electronic identity documents). It is not yet adopted by the Community
++    Group. A prototype exists in Chromium behind a runtime flag.
++  </div>
++
++  <p>
++    The <dfn>NFCIsoDepReader</dfn> exposes <a>ISO-DEP</a> cards that match an
++    <a>application policy</a> to the <a>browsing context</a>, as
++    {{NFCIsoDepTag}} objects with which the page exchanges
++    <a>command APDU</a>s. The only <a>application policy</a> defined by this
++    specification is for <a>eMRTD</a>s.
++  </p>
++  <pre class="idl">
++    enum NFCIsoDepApplication { "emrtd" };
++
++    dictionary NFCIsoDepScanOptions {
++      AbortSignal signal;
++      sequence&lt;NFCIsoDepApplication&gt; applications;
++    };
++
++    [SecureContext, Exposed=Window]
++    interface NFCIsoDepReader : EventTarget {
++      constructor();
++
++      attribute EventHandler onreading;
++      attribute EventHandler onreadingerror;
++
++      Promise&lt;undefined&gt; scan(optional NFCIsoDepScanOptions options={});
++    };
++
++    [SecureContext, Exposed=Window]
++    interface NFCIsoDepReadingEvent : Event {
++      constructor(DOMString type, NFCIsoDepReadingEventInit eventInitDict);
++
++      [SameObject] readonly attribute NFCIsoDepTag tag;
++    };
++
++    dictionary NFCIsoDepReadingEventInit : EventInit {
++      required NFCIsoDepTag tag;
++    };
++
++    [SecureContext, Exposed=Window]
++    interface NFCIsoDepTag {
++      readonly attribute Uint8Array? historicalBytes;
++      readonly attribute unsigned long maxTransceiveLength;
++      readonly attribute boolean extendedLengthApdu;
++
++      Promise&lt;Uint8Array&gt; transceive(BufferSource commandApdu);
++      Promise&lt;undefined&gt; close();
++    };
++  </pre>
++
++  <p>
++    The <dfn>onreading</dfn> is an {{EventHandler}} which is called when a
++    card matching an <a>application policy</a> is in proximity.
++  </p>
++  <p>
++    The <dfn>onreadingerror</dfn> is an {{EventHandler}} which is called when
++    an <a>ISO-DEP</a> card in proximity does not match any requested
++    <a>application policy</a>, or an error happens while classifying it.
++  </p>
++  <p data-dfn-for="NFCIsoDepScanOptions">
++    The <dfn>signal</dfn> member allows to abort the
++    {{NFCIsoDepReader/scan()}} operation. The <dfn>applications</dfn> member
++    lists the <a>application policies</a> the page requests. If it is not
++    present, it is treated as « {{NFCIsoDepApplication/"emrtd"}} ».
++  </p>
++  <p data-dfn-for="NFCIsoDepApplication">
++    The <dfn>"emrtd"</dfn> value identifies the <a>eMRTD application
++    policy</a>.
++  </p>
++  <p data-dfn-for="NFCIsoDepReadingEvent">
++    The <dfn>NFCIsoDepReadingEvent</dfn> is dispatched when a matching card
++    is in proximity. Its <dfn>tag</dfn> attribute is the {{NFCIsoDepTag}}
++    representing the session with that card.
++  </p>
++  <p data-dfn-for="NFCIsoDepReadingEventInit">
++    <dfn>NFCIsoDepReadingEventInit</dfn> initializes an
++    {{NFCIsoDepReadingEvent}} with the given <dfn>tag</dfn>.
++  </p>
++
++  <section><h3>ISO-DEP state associated with the settings object</h3>
++    <p>
++      The <a>NFC state</a> additionally has the following internal slots:
++    </p>
++    <table class="simple">
++      <thead>
++       <tr>
++        <th>Internal Slot</th>
++        <th>Initial value</th>
++        <th>Description (<em>non-normative</em>)</th>
++       </tr>
++      </thead>
++      <tbody>
++       <tr>
++        <td><dfn>[[\ActivatedIsoDepReaderList]]</dfn></td>
++        <td>empty <a>list</a></td>
++        <td>
++          A <a>list</a> of &lt;|reader:NFCIsoDepReader|,
++          |policies:list|&gt; tuples, in activation order, where |policies|
++          holds the <a>application policies</a> requested by |reader|.
++        </td>
++       </tr>
++       <tr>
++        <td><dfn>[[\ActiveIsoDepTag]]</dfn></td>
++        <td>null</td>
++        <td>
++          The {{NFCIsoDepTag}} of the current session, if any.
++        </td>
++       </tr>
++      </tbody>
++    </table>
++    <p>
++      The <dfn>activated ISO-DEP reader objects</dfn> is the value of the
++      <a>[[\ActivatedIsoDepReaderList]]</a> internal slot.
++    </p>
++    <p>
++      The <dfn>NFC task source</dfn> is a [=task source=] used to deliver
++      results of <a>ISO-DEP</a> exchanges.
++    </p>
++    <p>
++      To <dfn>close the active ISO-DEP session</dfn>, if
++      <a>[[\ActiveIsoDepTag]]</a> is not null, run the <a>close an ISO-DEP
++      session</a> steps given it, then set <a>[[\ActiveIsoDepTag]]</a> to
++      null.
++    </p>
++  </section>
++
++  <section data-dfn-for="NFCIsoDepTag" data-link-for="NFCIsoDepTag">
++    <h3>The NFCIsoDepTag interface</h3>
++    <p>
++      An <dfn>NFCIsoDepTag</dfn> represents a session with one card. It has
++      the following internal slots:
++    </p>
++    <table class="simple">
++      <thead>
++       <tr>
++        <th>Internal Slot</th>
++        <th>Initial value</th>
++        <th>Description (<em>non-normative</em>)</th>
++       </tr>
++      </thead>
++      <tbody>
++       <tr>
++        <td><dfn>[[\Policy]]</dfn></td>
++        <td>null</td>
++        <td>The <a>application policy</a> the card matched.</td>
++       </tr>
++       <tr>
++        <td><dfn>[[\Closed]]</dfn></td>
++        <td>false</td>
++        <td>Whether the session has ended.</td>
++       </tr>
++       <tr>
++        <td><dfn>[[\PendingTransceives]]</dfn></td>
++        <td>empty <a>list</a></td>
++        <td>Promises returned by {{NFCIsoDepTag/transceive()}} that are not yet settled.</td>
++       </tr>
++      </tbody>
++    </table>
++    <p>
++      The <dfn>historicalBytes</dfn> attribute returns the card's
++      <a>historical bytes</a>, or null if unavailable. The
++      <dfn>maxTransceiveLength</dfn> attribute returns the maximum length in
++      bytes of a <a>command APDU</a> accepted by
++      {{NFCIsoDepTag/transceive()}}. The <dfn>extendedLengthApdu</dfn>
++      attribute returns true if the card and <a>NFC adapter</a> support
++      extended-length <a>command APDU</a>s.
++    </p>
++
++    <section><h4>The <strong>transceive()</strong> method</h4>
++      <div>
++        The <dfn>transceive(commandApdu)</dfn> method steps are:
++        <ol class=algorithm>
++          <li>
++            Let |tag:NFCIsoDepTag| be [=this=].
++          </li>
++          <li>
++            If |tag|.<a>[[\Closed]]</a> is true, return [=a promise rejected
++            with=] an {{"InvalidStateError"}} {{DOMException}}.
++          </li>
++          <li>
++            Let |command:byte sequence| be a copy of the bytes held by
++            |commandApdu|.
++          </li>
++          <li>
++            If |command|'s [=byte sequence/length=] is less than 4, return
++            [=a promise rejected with=] a {{TypeError}}.
++          </li>
++          <li>
++            If |command|'s [=byte sequence/length=] is greater than
++            |tag|.{{NFCIsoDepTag/maxTransceiveLength}}, return [=a promise
++            rejected with=] a {{"SyntaxError"}} {{DOMException}}.
++          </li>
++          <li>
++            If the result of <a>check a command APDU</a> given |command| and
++            |tag|.<a>[[\Policy]]</a> is "`disallowed`", return [=a promise
++            rejected with=] a {{"NotAllowedError"}} {{DOMException}}.
++          </li>
++          <li>
++            Let |p:Promise| be a new {{Promise}} object and [=list/append=] it
++            to |tag|.<a>[[\PendingTransceives]]</a>.
++          </li>
++          <li>
++            Return |p| and run the following steps <a>in parallel</a>:
++            <ol>
++              <li>
++                Send |command| to the card over <a>ISO-DEP</a> and wait for the
++                <a>response APDU</a>. Commands of one {{NFCIsoDepTag}} are
++                sent in the order in which {{NFCIsoDepTag/transceive()}} was
++                called.
++              </li>
++              <li>
++                If |p| is no longer in |tag|.<a>[[\PendingTransceives]]</a>,
++                abort these steps.
++              </li>
++              <li>
++                [=Queue a global task=] on the <a>NFC task source</a> to run
++                the following steps:
++                <ol>
++                  <li>
++                    [=list/Remove=] |p| from |tag|.<a>[[\PendingTransceives]]</a>.
++                  </li>
++                  <li>
++                    If the card was removed or the exchange failed, reject |p|
++                    with a {{"NetworkError"}} {{DOMException}} and abort these
++                    steps.
++                  </li>
++                  <li>
++                    Resolve |p| with a new {{Uint8Array}} containing the
++                    <a>response APDU</a>, including its status bytes.
++                  </li>
++                </ol>
++              </li>
++            </ol>
++          </li>
++        </ol>
++      </div>
++      <p class="note">
++        The UA does not interpret status bytes. A card error such as
++        `6A 82` (file not found) resolves the promise; only transport failures
++        reject it.
++      </p>
++    </section>
++
++    <section><h4>The <strong>close()</strong> method</h4>
++      <p>
++        The <dfn>close()</dfn> method steps are: run the <a>close an ISO-DEP
++        session</a> steps given [=this=]; if [=this=] is the
++        <a data-link-for="NFCIsoDepReader">[[\ActiveIsoDepTag]]</a>, set
++        <a data-link-for="NFCIsoDepReader">[[\ActiveIsoDepTag]]</a> to null;
++        return [=a promise resolved with=] undefined.
++      </p>
++      <div>
++        To <dfn>close an ISO-DEP session</dfn> given an {{NFCIsoDepTag}}
++        |tag:NFCIsoDepTag|, run these steps:
++        <ol class=algorithm>
++          <li>
++            If |tag|.<a>[[\Closed]]</a> is true, abort these steps.
++          </li>
++          <li>
++            Set |tag|.<a>[[\Closed]]</a> to true.
++          </li>
++          <li>
++            [=list/For each=] |p| in |tag|.<a>[[\PendingTransceives]]</a>,
++            reject |p| with an {{"AbortError"}} {{DOMException}}.
++          </li>
++          <li>
++            [=list/Empty=] |tag|.<a>[[\PendingTransceives]]</a>.
++          </li>
++          <li>
++            Release the connection to the card on the underlying platform.
++          </li>
++        </ol>
++      </div>
++    </section>
++  </section>
++
++  <section id="application-policies"><h3>Application policies</h3>
++    <p>
++      An <dfn data-lt="application policies">application policy</dfn> defines
++      which <a>ISO-DEP</a> cards may be exposed to a page and which
++      <a>command APDU</a>s the page may send to them. It consists of:
++    </p>
++    <ul>
++      <li>
++        a <dfn>classification algorithm</dfn>, run by the UA on a card before
++        the page has access to it, which returns "`match`" or
++        "`no match`"; and
++      </li>
++      <li>
++        a <dfn>command filter</dfn>, which returns "`allowed`" or
++        "`disallowed`" for a <a>command APDU</a>.
++      </li>
++    </ul>
++    <p>
++      To <dfn>classify a card</dfn> given a list of <a>application
++      policies</a>, run each policy's <a>classification algorithm</a> in turn
++      and return the first policy that returns "`match`", or null.
++    </p>
++    <p>
++      To <dfn>check a command APDU</dfn> given a byte sequence |command| and
++      an <a>application policy</a> |policy|, return the result of running
++      |policy|'s <a>command filter</a> on |command|.
++    </p>
++
++    <section><h4>The eMRTD application policy</h4>
++      <p>
++        The <dfn>eMRTD application policy</dfn> is identified by
++        {{NFCIsoDepApplication/"emrtd"}}.
++      </p>
++      <div>
++        Its <a>classification algorithm</a> is:
++        <ol class=algorithm>
++          <li>
++            Send the <a>command APDU</a>
++            `00 A4 04 0C 07 A0 00 00 02 47 10 01` (<code>SELECT</code> of the
++            <a>eMRTD application identifier</a>). If the <a>response APDU</a>
++            ends with `90 00`, return "`match`".
++          </li>
++          <li>
++            Send `00 A4 02 0C 02 01 1C` (<code>SELECT</code> of the
++            <code>EF.CardAccess</code> file) followed by `00 B0 00 00 00`
++            (<code>READ BINARY</code>). If both succeed and the file contains
++            a <code>PACEInfo</code> object, i.e. the DER encoding of the object
++            identifier prefix id-PACE `0.4.0.127.0.7.2.2.4`
++            ([[BSI-TR-03110]], [[ICAO-9303]] part 11), return "`match`".
++          </li>
++          <li>
++            Return "`no match`".
++          </li>
++        </ol>
++        <p class="note">
++          The first step matches documents supporting Basic Access Control;
++          the second matches documents that only support PACE. The UA MAY use
++          other means that give the same result.
++        </p>
++      </div>
++      <div>
++        Its <a>command filter</a>, given a byte sequence |command|, is:
++        <ol class=algorithm>
++          <li>
++            Let |cla|, |ins| and |p1| be the first, second and third bytes of
++            |command|.
++          </li>
++          <li>
++            If |cla| bitwise AND `0x80` is not 0, return "`disallowed`".
++            <p class="note">
++              This excludes proprietary command classes, such as those used by
++              payment applications. They are not used by <a>eMRTD</a>s.
++            </p>
++          </li>
++          <li>
++            If |cla| bitwise AND `0x0C` is not 0, return "`allowed`".
++            <p class="note">
++              Such commands use secure messaging. They are opaque to the UA,
++              are only meaningful to a card that already matched this policy,
++              and can only be produced with the document's access key.
++            </p>
++          </li>
++          <li>
++            If |ins| is `0xA4` (<code>SELECT</code>):
++            <ol>
++              <li>
++                If |p1| is `0x04` (selection by name), return "`allowed`" if
++                the command data of |command| equals the <a>eMRTD application
++                identifier</a>, and "`disallowed`" otherwise.
++              </li>
++              <li>
++                If |p1| is `0x00` or `0x02` (selection by file identifier),
++                return "`allowed`".
++              </li>
++              <li>
++                Return "`disallowed`".
++              </li>
++            </ol>
++          </li>
++          <li>
++            If |ins| is one of `0xB0` or `0xB1` (<code>READ BINARY</code>),
++            `0x84` (<code>GET CHALLENGE</code>), `0x82`
++            (<code>EXTERNAL AUTHENTICATE</code>), `0x88`
++            (<code>INTERNAL AUTHENTICATE</code>), `0x22`
++            (<code>MANAGE SECURITY ENVIRONMENT</code>), `0x86`
++            (<code>GENERAL AUTHENTICATE</code>) or `0xC0`
++            (<code>GET RESPONSE</code>), return "`allowed`".
++          </li>
++          <li>
++            Return "`disallowed`".
++          </li>
++        </ol>
++      </div>
++    </section>
++  </section>
++
++  <section><h3>The <strong>scan()</strong> method</h3>
++    <div>
++      When the <dfn>scan(options)</dfn> method is invoked, the UA MUST run the
++      following <dfn>NFC ISO-DEP listen algorithm</dfn>:
++      <ol class=algorithm>
++        <li>
++          Let |p:Promise| be a new {{Promise}} object.
++        </li>
++        <li>
++          If not currently executing in the currently active <a>top-level
++          browsing context</a>, then reject |p| with an
++          {{"InvalidStateError"}} and return |p|.
++        </li>
++        <li>
++          If the <a>relevant global object</a> of [=this=] does not have
++          <a>transient activation</a>, reject |p| with a
++          {{"NotAllowedError"}} and return |p|.
++        </li>
++        <li>
++          Let |reader:NFCIsoDepReader| be [=this=].
++        </li>
++        <li>
++          Let |signal:AbortSignal| be |options|["{{NFCIsoDepScanOptions/signal}}"]
++          if it [=map/exists=], or null otherwise.
++        </li>
++        <li>
++          If |signal| is [= AbortSignal/aborted =], then reject |p| with
++          |signal|'s [=AbortSignal/abort reason=] and return |p|.
++        </li>
++        <li>
++          Let |policies:list| be the <a>application policies</a> identified by
++          |options|["{{NFCIsoDepScanOptions/applications}}"] if it
++          [=map/exists=], or « the <a>eMRTD application policy</a> »
++          otherwise. If |policies| [=list/is empty=], reject |p| with a
++          {{TypeError}} and return |p|.
++        </li>
++        <li>
++          If |signal| is not null, then
++          <a data-cite="dom#abortsignal-abort-algorithms">add the following
++          abort steps</a> to |signal|:
++          <ol>
++            <li>
++              Remove the tuple whose reader is |reader| from the
++              <a>activated ISO-DEP reader objects</a>.
++            </li>
++            <li>
++              If the <a>activated ISO-DEP reader objects</a> [= list/is
++              empty =], <a>close the active ISO-DEP session</a> and make a
++              request to stop listening for <a>ISO-DEP</a> cards.
++            </li>
++          </ol>
++        </li>
++        <li>
++          Return |p| and run the following steps <a>in parallel</a>:
++          <ol>
++            <li>
++              If the <a>obtain permission</a> steps return false, then reject
++              |p| with a {{"NotAllowedError"}} and abort these steps.
++            </li>
++            <li>
++              If there is no underlying <a>NFC Adapter</a>, or it does not
++              support <a>ISO-DEP</a>, then reject |p| with a
++              {{"NotSupportedError"}} and abort these steps.
++            </li>
++            <li>
++              If the UA is not allowed to access the underlying <a>NFC
++              Adapter</a> (e.g. a user preference), then reject |p| with a
++              {{"NotReadableError"}} and abort these steps.
++            </li>
++            <li>
++              If |reader| is already in the <a>activated ISO-DEP reader
++              objects</a>, then reject |p| with an {{"InvalidStateError"}} and
++              abort these steps.
++            </li>
++            <li>
++              [=list/Append=] &lt;|reader|, |policies|&gt; to the
++              <a>activated ISO-DEP reader objects</a>.
++            </li>
++            <li>
++              Resolve |p|.
++            </li>
++            <li>
++              Whenever the <a>UA</a> detects a card exposing <a>ISO-DEP</a>,
++              run the <a>NFC ISO-DEP reading algorithm</a>.
++            </li>
++          </ol>
++        </li>
++      </ol>
++    </div>
++  </section>
++
++  <section><h3>The NFC ISO-DEP reading algorithm</h3>
++    <div>
++      To handle a card, run the <dfn>NFC ISO-DEP reading algorithm</dfn>:
++      <ol class=algorithm>
++        <li>
++          If <a>NFC is suspended</a>, or the <a>activated ISO-DEP reader
++          objects</a> [=list/is empty=], abort these steps.
++        </li>
++        <li>
++          If the card is <a>blocklisted</a>, abort these steps.
++        </li>
++        <li>
++          The card is now claimed by this algorithm.
++        </li>
++        <li>
++          <a>Close the active ISO-DEP session</a>.
++        </li>
++        <li>
++          Let |requested:list| be the union, in order, of the policies of all
++          tuples in the <a>activated ISO-DEP reader objects</a>.
++        </li>
++        <li>
++          Let |policy| be the result of <a>classify a card</a> given
++          |requested|.
++        </li>
++        <li>
++          If |policy| is null, then [=list/for each=] tuple in the
++          <a>activated ISO-DEP reader objects</a>, <a>fire an event</a> named
++          "`readingerror`" at its reader. Release the connection to the card
++          and abort these steps.
++        </li>
++        <li>
++          Let |target:NFCIsoDepReader| be the reader of the last tuple in the
++          <a>activated ISO-DEP reader objects</a> whose policies contain
++          |policy|.
++        </li>
++        <li>
++          Let |tag:NFCIsoDepTag| be a new {{NFCIsoDepTag}} with
++          <a data-link-for="NFCIsoDepTag">[[\Policy]]</a> set to |policy|, and its attributes set from
++          the card and <a>NFC adapter</a>.
++        </li>
++        <li>
++          Set <a>[[\ActiveIsoDepTag]]</a> to |tag|.
++        </li>
++        <li>
++          <a>Fire an event</a> named "`reading`" at |target| using
++          {{NFCIsoDepReadingEvent}} with its {{NFCIsoDepReadingEvent/tag}}
++          attribute initialized to |tag|.
++        </li>
++      </ol>
++    </div>
++    <p class="note">
++      Only one reader receives the session, because a card can only take
++      part in one exchange at a time. If the card is removed, pending and
++      later {{NFCIsoDepTag/transceive()}} calls reject with a
++      {{"NetworkError"}}.
++    </p>
++  </section>
++</section> <!-- NFCIsoDepReader -->
++
+ <section> <h2 id="blocklist">The Blocklist</h2>
+   <p>
+     This specification relies on a blocklist file to restrict the set of NFC
+@@ -5025,6 +5710,67 @@
+         </dd>
+       </dl>
+     </section>
++
++    <section> <h4>Smart card skimming and relay over ISO-DEP</h4>
++      <dl>
++        <dt><strong>Threat description</strong></dt>
++        <dd>
++          A malicious web page uses {{NFCIsoDepReader}} to exchange commands
++          with a payment card, transit card or access badge near the device,
++          to read card data or to relay a transaction to a remote terminal.
++        </dd>
++        <dt><strong>Affected assets</strong></dt>
++        <dd>
++          Payment and access credentials, user funds.
++        </dd>
++        <dt><strong>Actors</strong></dt>
++        <dd>
++          Malicious web page owner using Web NFC.
++        </dd>
++        <dt><strong>Mitigation, comments</strong></dt>
++        <dd>
++          The UA only exposes cards that match an <a>application policy</a>,
++          by running the policy's <a>classification algorithm</a> before the
++          page has access to the card. A payment card does not match the
++          <a>eMRTD application policy</a>. The <a>command filter</a> further
++          refuses selection of any application other than the <a>eMRTD
++          application identifier</a> and all proprietary command classes.
++          {{NFCIsoDepReader/scan()}} requires <a>transient activation</a> and
++          permission, and NFC is <a>suspended</a> when the page is not
++          visible.
++        </dd>
++      </dl>
++    </section>
++
++    <section> <h4>Identity document data disclosure</h4>
++      <dl>
++        <dt><strong>Threat description</strong></dt>
++        <dd>
++          A malicious web page reads the personal data and facial image stored
++          on an <a>eMRTD</a> without the user's informed consent.
++        </dd>
++        <dt><strong>Affected assets</strong></dt>
++        <dd>
++          User identity, biometric data.
++        </dd>
++        <dt><strong>Actors</strong></dt>
++        <dd>
++          Malicious web page owner using Web NFC.
++        </dd>
++        <dt><strong>Mitigation, comments</strong></dt>
++        <dd>
++          An <a>eMRTD</a> discloses no personal data until the reader proves
++          knowledge of the document's access key (BAC or PACE). A page that
++          does not know the key obtains nothing from the chip; a page that has
++          the key, typically because the user typed or photographed the MRZ,
++          has already been given the printed data. The user also has to physically
++          hold the document to the device. The permission prompt SHOULD name
++          the document type. Active authentication and chip authentication
++          produce signatures proving that the chip was present; UAs SHOULD
++          make users aware that the site receives such proof.
++        </dd>
++      </dl>
++    </section>
+   </section>
+ 
+   <section class="informative"> <h2>Security mechanisms for implementations</h2>
+@@ -5134,6 +5880,22 @@
+       </p>
+     </section>
+ 
++    <section> <h4>ISO-DEP application policy</h4>
++      <p>
++        An {{NFCIsoDepReader}} MUST NOT expose a card to a page unless the
++        card has <a data-lt="classify a card">matched</a> an
++        <a>application policy</a> requested by the page, and the UA MUST
++        <a data-lt="check a command APDU">check every command APDU</a>
++        against that policy before sending it to the card.
++      </p>
++      <p>
++        Calling {{NFCIsoDepReader/scan()}} MUST require <a>transient
++        activation</a> and MUST <a>obtain permission</a>. The UA SHOULD name
++        the requested document type in the permission prompt, for instance
++        "read your passport or identity card chip".
++      </p>
++    </section>
++
+     <section> <h4>Blocklist</h4>
+       <p>
+         Web NFC includes a <a>blocklist</a> of vulnerable NFC devices to prevent
+-- 
+2.54.0 (Apple Git-157)
+

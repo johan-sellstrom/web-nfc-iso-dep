@@ -1,0 +1,45 @@
+From 04b51f1768e7d894744e18c9b08a010e61dc48a1 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Johan=20Sellstr=C3=B6m?= <johan.sellstrom@iproov.com>
+Date: Fri, 2 Oct 2026 12:26:07 +0000
+Subject: [PATCH] fixup: allow GET RESPONSE; 30 s ISO-DEP timeout
+
+Chips without extended length chain long responses (SW1 = 0x61) and need
+GET RESPONSE, which native eMRTD readers send in plaintext. RSA Active
+Authentication can exceed 5 s on slow chips.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../android/java/src/org/chromium/device/nfc/EmrtdPolicy.java | 1 +
+ .../nfc/android/java/src/org/chromium/device/nfc/NfcImpl.java | 4 +++-
+ 2 files changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/services/device/nfc/android/java/src/org/chromium/device/nfc/EmrtdPolicy.java b/services/device/nfc/android/java/src/org/chromium/device/nfc/EmrtdPolicy.java
+index fac4bbd8fe..e5a0a50eb3 100644
+--- a/services/device/nfc/android/java/src/org/chromium/device/nfc/EmrtdPolicy.java
++++ b/services/device/nfc/android/java/src/org/chromium/device/nfc/EmrtdPolicy.java
+@@ -90,6 +90,7 @@ final class EmrtdPolicy {
+             case 0x88: // INTERNAL AUTHENTICATE (Active Authentication)
+             case 0x22: // MANAGE SECURITY ENVIRONMENT (PACE, Chip Authentication)
+             case 0x86: // GENERAL AUTHENTICATE (PACE, Chip Authentication)
++            case 0xC0: // GET RESPONSE (response chaining, SW1 = 0x61)
+                 return null;
+             default:
+                 return "Command not allowed for eMRTD sessions.";
+diff --git a/services/device/nfc/android/java/src/org/chromium/device/nfc/NfcImpl.java b/services/device/nfc/android/java/src/org/chromium/device/nfc/NfcImpl.java
+index cae27b8b20..0c40e7d49d 100644
+--- a/services/device/nfc/android/java/src/org/chromium/device/nfc/NfcImpl.java
++++ b/services/device/nfc/android/java/src/org/chromium/device/nfc/NfcImpl.java
+@@ -801,7 +801,9 @@ public class NfcImpl implements Nfc {
+                     boolean isEmrtd = false;
+                     try {
+                         if (!isoDep.isConnected()) isoDep.connect();
+-                        isoDep.setTimeout(5000);
++                        // Slow chips (e.g. RSA Active Authentication) need long
++                        // timeouts; matches the native eMRTD SDKs.
++                        isoDep.setTimeout(30000);
+                         isEmrtd = EmrtdPolicy.isEmrtd(isoDep);
+                     } catch (IOException | IllegalStateException | SecurityException e) {
+                         Log.w(TAG, "ISO-DEP classification failed: " + e.getMessage());
+-- 
+2.43.0
+

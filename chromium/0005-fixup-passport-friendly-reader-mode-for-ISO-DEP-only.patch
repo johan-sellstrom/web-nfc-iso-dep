@@ -1,0 +1,133 @@
+From 92e87bd1703beaea03fb1edc8b983940abdcbeed Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Johan=20Sellstr=C3=B6m?= <johan.sellstrom@iproov.com>
+Date: Sat, 3 Oct 2026 10:03:10 +0000
+Subject: [PATCH] fixup: passport-friendly reader mode for ISO-DEP-only
+ sessions
+
+Seen on a Galaxy Z Fold3 with a real passport: the tag was dispatched and
+the platform presence check declared it lost 3 ms later. While only
+ISO-DEP readers are active, enable reader mode with NFC-A/B only,
+FLAG_READER_SKIP_NDEF_CHECK and a 1 s presence-check delay, as native
+eMRTD readers do. Reader mode is re-enabled when NDEF operations join or
+leave, so NDEF reading keeps the NDEF check.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../src/org/chromium/device/nfc/NfcImpl.java  | 55 ++++++++++++++++---
+ 1 file changed, 46 insertions(+), 9 deletions(-)
+
+diff --git a/services/device/nfc/android/java/src/org/chromium/device/nfc/NfcImpl.java b/services/device/nfc/android/java/src/org/chromium/device/nfc/NfcImpl.java
+index 0c40e7d49d..9fb7b259ba 100644
+--- a/services/device/nfc/android/java/src/org/chromium/device/nfc/NfcImpl.java
++++ b/services/device/nfc/android/java/src/org/chromium/device/nfc/NfcImpl.java
+@@ -18,6 +18,7 @@ import android.nfc.TagLostException;
+ import android.nfc.tech.IsoDep;
+ import android.nfc.tech.Ndef;
+ import android.nfc.tech.NdefFormatable;
++import android.os.Bundle;
+ import android.os.Process;
+ import android.os.Vibrator;
+ 
+@@ -121,6 +122,12 @@ public class NfcImpl implements Nfc {
+     /** The active eMRTD session handed to the client, if any. */
+     private @Nullable IsoDepSession mIsoDepSession;
+ 
++    /** Whether reader mode was last enabled in the ISO-DEP-only configuration. */
++    private boolean mReaderModeIsoDepOnly;
++
++    /** Presence-check interval while only eMRTD readers are active. */
++    private static final int ISO_DEP_PRESENCE_CHECK_MS = 1000;
++
+     /** Runs blocking ISO-DEP I/O (classification and transceive) in order, off the UI thread. */
+     private final SequencedTaskRunner mIsoDepTaskRunner =
+             PostTask.createSequencedTaskRunner(TaskTraits.USER_BLOCKING_MAY_BLOCK);
+@@ -250,7 +257,7 @@ public class NfcImpl implements Nfc {
+ 
+         mPendingPushOperation = new PendingPushOperation(message, options, callback);
+ 
+-        enableReaderModeIfNeeded();
++        refreshReaderMode();
+         processPendingPushOperation();
+     }
+ 
+@@ -292,7 +299,7 @@ public class NfcImpl implements Nfc {
+ 
+         mPendingMakeReadOnlyOperation = new PendingMakeReadOnlyOperation(callback);
+ 
+-        enableReaderModeIfNeeded();
++        refreshReaderMode();
+         processPendingMakeReadOnlyOperation();
+     }
+ 
+@@ -333,7 +340,7 @@ public class NfcImpl implements Nfc {
+         }
+         mWatchIds.add(id);
+         callback.call(null);
+-        enableReaderModeIfNeeded();
++        refreshReaderMode();
+         processPendingWatchOperations();
+     }
+ 
+@@ -378,7 +385,7 @@ public class NfcImpl implements Nfc {
+         }
+         mIsoDepWatchIds.add(id);
+         callback.call(null);
+-        enableReaderModeIfNeeded();
++        refreshReaderMode();
+     }
+ 
+     @Override
+@@ -530,15 +537,45 @@ public class NfcImpl implements Nfc {
+         if (!hasActiveOperations()) return;
+ 
+         mReaderCallbackHandler = new ReaderCallbackHandler(this);
+-        mNfcAdapter.enableReaderMode(
+-                mActivity,
+-                mReaderCallbackHandler,
++        mReaderModeIsoDepOnly = isIsoDepOnly();
++        Bundle extras = null;
++        int flags =
+                 NfcAdapter.FLAG_READER_NFC_A
+                         | NfcAdapter.FLAG_READER_NFC_B
+                         | NfcAdapter.FLAG_READER_NFC_F
+                         | NfcAdapter.FLAG_READER_NFC_V
+-                        | NfcAdapter.FLAG_READER_NO_PLATFORM_SOUNDS,
+-                null);
++                        | NfcAdapter.FLAG_READER_NO_PLATFORM_SOUNDS;
++        if (mReaderModeIsoDepOnly) {
++            // eMRTDs: the platform's NDEF check (SELECT of the NDEF application)
++            // and its default 125 ms presence check make some passport chips drop
++            // the session right after discovery. Native eMRTD readers skip the
++            // NDEF check and slow the presence check down; do the same while only
++            // ISO-DEP readers are active. NFC-F/V cannot carry an eMRTD.
++            flags =
++                    NfcAdapter.FLAG_READER_NFC_A
++                            | NfcAdapter.FLAG_READER_NFC_B
++                            | NfcAdapter.FLAG_READER_SKIP_NDEF_CHECK
++                            | NfcAdapter.FLAG_READER_NO_PLATFORM_SOUNDS;
++            extras = new Bundle();
++            extras.putInt(NfcAdapter.EXTRA_READER_PRESENCE_CHECK_DELAY, ISO_DEP_PRESENCE_CHECK_MS);
++        }
++        mNfcAdapter.enableReaderMode(mActivity, mReaderCallbackHandler, flags, extras);
++    }
++
++    /** True if the only active operations are ISO-DEP (eMRTD) watches. */
++    private boolean isIsoDepOnly() {
++        return !mIsoDepWatchIds.isEmpty()
++                && mWatchIds.isEmpty()
++                && mPendingPushOperation == null
++                && mPendingMakeReadOnlyOperation == null;
++    }
++
++    /** Re-enables reader mode if the NDEF / ISO-DEP mix changed its configuration. */
++    private void refreshReaderMode() {
++        if (mReaderCallbackHandler != null && mReaderModeIsoDepOnly != isIsoDepOnly()) {
++            disableReaderMode();
++        }
++        enableReaderModeIfNeeded();
+     }
+ 
+     /**
+-- 
+2.43.0
+

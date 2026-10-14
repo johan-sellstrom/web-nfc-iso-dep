@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NFCIsoDepReader demo</title>
+<style>
+  :root { --bg: #fff; --fg: #1a1a1a; --muted: #666; --ok: #0a7d32; --bad: #b3261e; --line: #ddd; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #121212; --fg: #eee; --muted: #999; --ok: #5bd17f; --bad: #ff8a80; --line: #333; } }
+  body { background: var(--bg); color: var(--fg); font: 16px/1.4 system-ui, sans-serif; margin: 0 auto; max-width: 640px; padding: 16px; }
+  h1 { font-size: 1.3rem; }
+  button { font: inherit; padding: 10px 16px; margin: 4px 4px 4px 0; }
+  input { font: inherit; padding: 8px; width: 100%; box-sizing: border-box; }
+  label { display: block; margin-top: 12px; color: var(--muted); font-size: .9rem; }
+  pre { background: transparent; border: 1px solid var(--line); padding: 8px; white-space: pre-wrap; word-break: break-all; font-size: .8rem; min-height: 8em; }
+  .ok { color: var(--ok); } .bad { color: var(--bad); }
+</style>
+</head>
+<body>
+<h1>NFCIsoDepReader demo</h1>
+<p id="support"></p>
+
+<p>Selects the eMRTD application on a passport or ID card, asks the chip for a random
+challenge, and reads <code>EF.CardAccess</code>. None of this needs the document's access key.
+It then tries two payment-card commands, which the browser must refuse.</p>
+
+<button id="diag">Scan a passport or ID card</button>
+<button id="stop">Stop</button>
+
+
+<pre id="log"></pre>
+
+<script>
+const log = (msg, cls) => {
+  const line = document.createElement('div');
+  if (cls) line.className = cls;
+  line.textContent = `${new Date().toISOString().slice(11, 23)} ${msg}`;
+  document.getElementById('log').prepend(line);
+};
+const hex = (u8) => [...u8].map(b => b.toString(16).padStart(2, '0')).join('');
+const unhex = (s) => new Uint8Array(s.replace(/\s+/g, '').match(/../g).map(h => parseInt(h, 16)));
+const sw = (r) => hex(r.slice(-2));
+
+const supported = 'NFCIsoDepReader' in window;
+document.getElementById('support').innerHTML = supported
+  ? '<span class="ok">NFCIsoDepReader is available.</span>'
+  : '<span class="bad">NFCIsoDepReader is not available in this browser. Open this page in the prototype Chromium build on an Android phone (see the repository README).</span>';
+
+let controller = null;
+
+async function send(tag, apduHex, label) {
+  try {
+    const r = await tag.transceive(unhex(apduHex));
+    log(`${label}: > ${apduHex}  < ${hex(r)} (SW ${sw(r)})`, sw(r) === '9000' ? 'ok' : undefined);
+    return r;
+  } catch (e) {
+    log(`${label}: > ${apduHex}  rejected: ${e.name}: ${e.message}`, 'bad');
+    return null;
+  }
+}
+
+// Shows live chip interaction and the browser's command filter, without needing the access key.
+async function diagnostics(tag) {
+  log(`tag: maxTransceiveLength=${tag.maxTransceiveLength} extendedLengthApdu=${tag.extendedLengthApdu} historicalBytes=${tag.historicalBytes ? hex(tag.historicalBytes) : 'null'}`);
+  await send(tag, '00A4040C07A0000002471001', 'SELECT eMRTD application');
+  await send(tag, '0084000008', 'GET CHALLENGE (BAC)');
+  await send(tag, '00A4020C02011C', 'SELECT EF.CardAccess');
+  await send(tag, '00B0000000', 'READ BINARY EF.CardAccess');
+  log('policy checks (expected to be rejected by the browser):');
+  await send(tag, '00A404000E325041592E5359532E444446303100', 'SELECT PPSE (payment)');
+  await send(tag, '80A8000002830000', 'GET PROCESSING OPTIONS (EMV)');
+  await tag.close();
+  log('session closed');
+}
+
+async function start(handler) {
+  if (!supported) return;
+  controller?.abort();
+  controller = new AbortController();
+  const reader = new NFCIsoDepReader();
+  reader.onreading = ({ tag }) => { log('identity document detected', 'ok'); handler(tag); };
+  reader.onreadingerror = () => log('tag is not an identity document (or read error)', 'bad');
+  try {
+    await reader.scan({ signal: controller.signal, applications: ['emrtd'] });
+    log('scanning: hold the passport or ID card to the back of the phone');
+  } catch (e) {
+    log(`scan failed: ${e.name}: ${e.message}`, 'bad');
+  }
+}
+
+document.getElementById('diag').onclick = () => start(diagnostics);
+document.getElementById('stop').onclick = () => { controller?.abort(); log('stopped'); };
+</script>
+</body>
+</html>

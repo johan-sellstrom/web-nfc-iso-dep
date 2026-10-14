@@ -1,0 +1,1623 @@
+From 17af8b480b376dc2ff9f0672b07374d0f94fe1af Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Johan=20Sellstr=C3=B6m?= <johan.sellstrom@iproov.com>
+Date: Fri, 2 Oct 2026 07:20:48 +0000
+Subject: [PATCH] [Prototype] Web NFC: NFCIsoDepReader for eMRTD identity
+ documents
+
+Adds NFCIsoDepReader / NFCIsoDepTag behind the WebNFCIsoDep runtime flag.
+The browser classifies tapped ISO-DEP tags as ICAO Doc 9303 eMRTDs before
+exposing them, and filters plaintext command APDUs so only the eMRTD
+application can be selected. Android only; iOS rejects scan() with
+NotSupportedError.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ services/device/nfc/android/BUILD.gn          |   2 +
+ .../org/chromium/device/nfc/EmrtdPolicy.java  | 136 ++++++++++
+ .../chromium/device/nfc/IsoDepSession.java    | 111 +++++++++
+ .../src/org/chromium/device/nfc/NfcImpl.java  | 140 ++++++++++-
+ .../public/cpp/test/scoped_nfc_overrider.cc   |   3 +
+ services/device/public/mojom/nfc.mojom        |  33 +++
+ .../bindings/generated_in_modules.gni         |  10 +
+ .../renderer/bindings/idl_in_modules.gni      |   4 +
+ .../modules/event_target_modules_names.json5  |   1 +
+ .../blink/renderer/modules/nfc/BUILD.gn       |   6 +
+ .../modules/nfc/nfc_iso_dep_reader.cc         | 235 ++++++++++++++++++
+ .../renderer/modules/nfc/nfc_iso_dep_reader.h |  86 +++++++
+ .../modules/nfc/nfc_iso_dep_reader.idl        |  18 ++
+ .../modules/nfc/nfc_iso_dep_reading_event.cc  |  30 +++
+ .../modules/nfc/nfc_iso_dep_reading_event.h   |  33 +++
+ .../modules/nfc/nfc_iso_dep_reading_event.idl |  11 +
+ .../modules/nfc/nfc_iso_dep_scan_options.idl  |  11 +
+ .../renderer/modules/nfc/nfc_iso_dep_tag.cc   | 148 +++++++++++
+ .../renderer/modules/nfc/nfc_iso_dep_tag.h    |  74 ++++++
+ .../renderer/modules/nfc/nfc_iso_dep_tag.idl  |  17 ++
+ .../blink/renderer/modules/nfc/nfc_proxy.cc   |  82 ++++++
+ .../blink/renderer/modules/nfc/nfc_proxy.h    |  25 ++
+ .../renderer/modules/nfc/nfc_proxy_test.cc    |   5 +
+ .../platform/runtime_enabled_features.json5   |   9 +
+ 24 files changed, 1229 insertions(+), 1 deletion(-)
+ create mode 100644 services/device/nfc/android/java/src/org/chromium/device/nfc/EmrtdPolicy.java
+ create mode 100644 services/device/nfc/android/java/src/org/chromium/device/nfc/IsoDepSession.java
+ create mode 100644 third_party/blink/renderer/modules/nfc/nfc_iso_dep_reader.cc
+ create mode 100644 third_party/blink/renderer/modules/nfc/nfc_iso_dep_reader.h
+ create mode 100644 third_party/blink/renderer/modules/nfc/nfc_iso_dep_reader.idl
+ create mode 100644 third_party/blink/renderer/modules/nfc/nfc_iso_dep_reading_event.cc
+ create mode 100644 third_party/blink/renderer/modules/nfc/nfc_iso_dep_reading_event.h
+ create mode 100644 third_party/blink/renderer/modules/nfc/nfc_iso_dep_reading_event.idl
+ create mode 100644 third_party/blink/renderer/modules/nfc/nfc_iso_dep_scan_options.idl
+ create mode 100644 third_party/blink/renderer/modules/nfc/nfc_iso_dep_tag.cc
+ create mode 100644 third_party/blink/renderer/modules/nfc/nfc_iso_dep_tag.h
+ create mode 100644 third_party/blink/renderer/modules/nfc/nfc_iso_dep_tag.idl
+
+diff --git a/services/device/nfc/android/BUILD.gn b/services/device/nfc/android/BUILD.gn
+index e959c29361..4b9a63c93b 100644
+--- a/services/device/nfc/android/BUILD.gn
++++ b/services/device/nfc/android/BUILD.gn
+@@ -11,7 +11,9 @@ android_library("java") {
+     "//services/device:*",
+   ]
+   sources = [
++    "java/src/org/chromium/device/nfc/EmrtdPolicy.java",
+     "java/src/org/chromium/device/nfc/InvalidNdefMessageException.java",
++    "java/src/org/chromium/device/nfc/IsoDepSession.java",
+     "java/src/org/chromium/device/nfc/NdefMessageUtils.java",
+     "java/src/org/chromium/device/nfc/NdefMessageValidator.java",
+     "java/src/org/chromium/device/nfc/NfcBlocklist.java",
+diff --git a/services/device/nfc/android/java/src/org/chromium/device/nfc/EmrtdPolicy.java b/services/device/nfc/android/java/src/org/chromium/device/nfc/EmrtdPolicy.java
+new file mode 100644
+index 0000000000..fac4bbd8fe
+--- /dev/null
++++ b/services/device/nfc/android/java/src/org/chromium/device/nfc/EmrtdPolicy.java
+@@ -0,0 +1,136 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package org.chromium.device.nfc;
++
++import android.nfc.tech.IsoDep;
++
++import org.chromium.build.annotations.NullMarked;
++import org.chromium.build.annotations.Nullable;
++
++import java.io.IOException;
++import java.util.Arrays;
++
++/**
++ * Browser-enforced policy for NFCIsoDepReader sessions. Only ISO-DEP tags that identify as
++ * electronic machine readable travel documents (ICAO Doc 9303) are exposed to the page, and
++ * plaintext commands are filtered so that no other card application can be selected.
++ */
++@NullMarked
++final class EmrtdPolicy {
++    /** ICAO eMRTD LDS1 application identifier. */
++    static final byte[] EMRTD_AID = {
++        (byte) 0xA0, 0x00, 0x00, 0x02, 0x47, 0x10, 0x01
++    };
++
++    /** id-PACE (BSI TR-03110 / ICAO 9303-11) OID prefix 0.4.0.127.0.7.2.2.4, DER-encoded. */
++    private static final byte[] PACE_OID_PREFIX = {
++        0x04, 0x00, 0x7F, 0x00, 0x07, 0x02, 0x02, 0x04
++    };
++
++    private static final int INS_SELECT = 0xA4;
++
++    private EmrtdPolicy() {}
++
++    /**
++     * Returns true if the connected tag is an eMRTD: either the eMRTD application can be selected
++     * in plaintext (BAC and most PACE documents), or EF.CardAccess at the master file advertises
++     * PACE (PACE-only documents). Must be called off the UI thread.
++     */
++    static boolean isEmrtd(IsoDep isoDep) throws IOException {
++        byte[] selectAid = new byte[5 + EMRTD_AID.length];
++        selectAid[0] = 0x00;
++        selectAid[1] = (byte) INS_SELECT;
++        selectAid[2] = 0x04;
++        selectAid[3] = 0x0C;
++        selectAid[4] = (byte) EMRTD_AID.length;
++        System.arraycopy(EMRTD_AID, 0, selectAid, 5, EMRTD_AID.length);
++        if (isSuccess(isoDep.transceive(selectAid))) return true;
++
++        byte[] selectCardAccess = {0x00, (byte) INS_SELECT, 0x02, 0x0C, 0x02, 0x01, 0x1C};
++        if (!isSuccess(isoDep.transceive(selectCardAccess))) return false;
++        byte[] cardAccess = isoDep.transceive(new byte[] {0x00, (byte) 0xB0, 0x00, 0x00, 0x00});
++        return cardAccess.length > 2
++                && isSuccessOrWarning(cardAccess)
++                && indexOf(cardAccess, PACE_OID_PREFIX) >= 0;
++    }
++
++    /**
++     * Checks a command APDU from the page. Returns null if the command may be sent to the tag,
++     * otherwise a human readable reason.
++     */
++    static @Nullable String checkCommand(byte[] apdu) {
++        if (apdu.length < 4) return "Malformed command APDU.";
++        int cla = apdu[0] & 0xFF;
++        int ins = apdu[1] & 0xFF;
++        int p1 = apdu[2] & 0xFF;
++
++        // Proprietary classes (e.g. EMV payment commands) are never needed for eMRTDs.
++        if ((cla & 0x80) != 0) return "Proprietary command classes are not allowed.";
++
++        // Secure messaging commands are opaque to the browser. They are only meaningful to a chip
++        // that has already been classified as an eMRTD and require the document's access key.
++        if ((cla & 0x0C) != 0) return null;
++
++        switch (ins) {
++            case INS_SELECT:
++                if (p1 == 0x04) {
++                    byte[] aid = commandData(apdu);
++                    if (aid != null && Arrays.equals(aid, EMRTD_AID)) return null;
++                    return "Only the eMRTD application may be selected.";
++                }
++                // Selection by file identifier (MF, EF.CardAccess, EF.COM, data groups).
++                if (p1 == 0x00 || p1 == 0x02) return null;
++                return "Unsupported SELECT mode.";
++            case 0xB0: // READ BINARY
++            case 0xB1: // READ BINARY (odd INS)
++            case 0x84: // GET CHALLENGE (BAC)
++            case 0x82: // EXTERNAL AUTHENTICATE (BAC)
++            case 0x88: // INTERNAL AUTHENTICATE (Active Authentication)
++            case 0x22: // MANAGE SECURITY ENVIRONMENT (PACE, Chip Authentication)
++            case 0x86: // GENERAL AUTHENTICATE (PACE, Chip Authentication)
++                return null;
++            default:
++                return "Command not allowed for eMRTD sessions.";
++        }
++    }
++
++    /** Returns the command data field of a short or extended APDU, or null if absent. */
++    private static byte @Nullable [] commandData(byte[] apdu) {
++        if (apdu.length < 6) return null;
++        int lc = apdu[4] & 0xFF;
++        int offset = 5;
++        if (lc == 0) {
++            // Extended length: 00 Lc1 Lc2.
++            if (apdu.length < 8) return null;
++            lc = ((apdu[5] & 0xFF) << 8) | (apdu[6] & 0xFF);
++            offset = 7;
++        }
++        if (lc == 0 || offset + lc > apdu.length) return null;
++        return Arrays.copyOfRange(apdu, offset, offset + lc);
++    }
++
++    private static boolean isSuccess(byte[] response) {
++        int n = response.length;
++        return n >= 2 && response[n - 2] == (byte) 0x90 && response[n - 1] == 0x00;
++    }
++
++    private static boolean isSuccessOrWarning(byte[] response) {
++        int n = response.length;
++        // 9000, or 6282 (end of file reached before Le bytes) which is common for EF.CardAccess.
++        return isSuccess(response)
++                || (n >= 2 && response[n - 2] == 0x62 && response[n - 1] == (byte) 0x82);
++    }
++
++    private static int indexOf(byte[] haystack, byte[] needle) {
++        outer:
++        for (int i = 0; i + needle.length <= haystack.length; i++) {
++            for (int j = 0; j < needle.length; j++) {
++                if (haystack[i + j] != needle[j]) continue outer;
++            }
++            return i;
++        }
++        return -1;
++    }
++}
+diff --git a/services/device/nfc/android/java/src/org/chromium/device/nfc/IsoDepSession.java b/services/device/nfc/android/java/src/org/chromium/device/nfc/IsoDepSession.java
+new file mode 100644
+index 0000000000..98449cbeb7
+--- /dev/null
++++ b/services/device/nfc/android/java/src/org/chromium/device/nfc/IsoDepSession.java
+@@ -0,0 +1,111 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package org.chromium.device.nfc;
++
++import android.nfc.TagLostException;
++import android.nfc.tech.IsoDep;
++
++import org.chromium.base.Log;
++import org.chromium.base.task.PostTask;
++import org.chromium.base.task.SequencedTaskRunner;
++import org.chromium.base.task.TaskTraits;
++import org.chromium.build.annotations.NullMarked;
++import org.chromium.device.mojom.NdefError;
++import org.chromium.device.mojom.NdefErrorType;
++import org.chromium.device.mojom.NfcIsoDepTag;
++import org.chromium.mojo.system.MojoException;
++
++import java.io.IOException;
++
++/**
++ * Implementation of device.mojom.NFCIsoDepTag: one session with a connected eMRTD tag. Commands
++ * are checked against {@link EmrtdPolicy} on the calling (UI) thread and exchanged with the tag
++ * on a sequenced background runner, since IsoDep#transceive blocks.
++ */
++@NullMarked
++class IsoDepSession implements NfcIsoDepTag {
++    private static final String TAG = "IsoDepSession";
++
++    private final IsoDep mIsoDep;
++    private final SequencedTaskRunner mTaskRunner;
++    private final Runnable mOnClosed;
++    private boolean mClosed;
++
++    IsoDepSession(IsoDep isoDep, SequencedTaskRunner taskRunner, Runnable onClosed) {
++        mIsoDep = isoDep;
++        mTaskRunner = taskRunner;
++        mOnClosed = onClosed;
++    }
++
++    @Override
++    public void transceive(byte[] command, Transceive_Response callback) {
++        if (mClosed) {
++            callback.call(null, createError(NdefErrorType.IO_ERROR, "The session is closed."));
++            return;
++        }
++        String reason = EmrtdPolicy.checkCommand(command);
++        if (reason != null) {
++            callback.call(null, createError(NdefErrorType.NOT_ALLOWED, reason));
++            return;
++        }
++        if (command.length > mIsoDep.getMaxTransceiveLength()) {
++            callback.call(
++                    null,
++                    createError(
++                            NdefErrorType.INVALID_MESSAGE,
++                            "Command exceeds the tag's maximum transceive length."));
++            return;
++        }
++        mTaskRunner.execute(
++                () -> {
++                    byte[] response = null;
++                    NdefError error = null;
++                    try {
++                        response = mIsoDep.transceive(command);
++                    } catch (TagLostException e) {
++                        error = createError(NdefErrorType.IO_ERROR, "The tag was lost.");
++                    } catch (IOException | IllegalStateException | SecurityException e) {
++                        Log.w(TAG, "transceive failed: " + e.getMessage());
++                        error =
++                                createError(
++                                        NdefErrorType.IO_ERROR,
++                                        "Transceive failed: " + e.getMessage());
++                    }
++                    final byte[] finalResponse = response;
++                    final NdefError finalError = error;
++                    PostTask.postTask(
++                            TaskTraits.UI_USER_BLOCKING,
++                            () -> callback.call(finalResponse, finalError));
++                });
++    }
++
++    /** Ends the session. Called when the page drops the pipe or the browser cancels the scan. */
++    @Override
++    public void close() {
++        if (mClosed) return;
++        mClosed = true;
++        mTaskRunner.execute(
++                () -> {
++                    try {
++                        mIsoDep.close();
++                    } catch (IOException e) {
++                        // Ignored: the tag may already be out of range.
++                    }
++                });
++        mOnClosed.run();
++    }
++
++    @Override
++    public void onConnectionError(MojoException e) {
++        close();
++    }
++
++    static NdefError createError(int errorType, String errorMessage) {
++        NdefError error = new NdefError();
++        error.errorType = errorType;
++        error.errorMessage = errorMessage;
++        return error;
++    }
++}
+diff --git a/services/device/nfc/android/java/src/org/chromium/device/nfc/NfcImpl.java b/services/device/nfc/android/java/src/org/chromium/device/nfc/NfcImpl.java
+index 20f7f83a84..cae27b8b20 100644
+--- a/services/device/nfc/android/java/src/org/chromium/device/nfc/NfcImpl.java
++++ b/services/device/nfc/android/java/src/org/chromium/device/nfc/NfcImpl.java
+@@ -15,6 +15,9 @@ import android.nfc.NfcAdapter.ReaderCallback;
+ import android.nfc.NfcManager;
+ import android.nfc.Tag;
+ import android.nfc.TagLostException;
++import android.nfc.tech.IsoDep;
++import android.nfc.tech.Ndef;
++import android.nfc.tech.NdefFormatable;
+ import android.os.Process;
+ import android.os.Vibrator;
+ 
+@@ -23,6 +26,7 @@ import org.chromium.base.CollectionUtil;
+ import org.chromium.base.ContextUtils;
+ import org.chromium.base.Log;
+ import org.chromium.base.task.PostTask;
++import org.chromium.base.task.SequencedTaskRunner;
+ import org.chromium.base.task.TaskTraits;
+ import org.chromium.build.annotations.NullMarked;
+ import org.chromium.build.annotations.Nullable;
+@@ -34,6 +38,7 @@ import org.chromium.device.mojom.NdefRecord;
+ import org.chromium.device.mojom.NdefWriteOptions;
+ import org.chromium.device.mojom.Nfc;
+ import org.chromium.device.mojom.NfcClient;
++import org.chromium.device.mojom.NfcIsoDepTagInfo;
+ import org.chromium.mojo.bindings.InterfaceRequest;
+ import org.chromium.mojo.bindings.Router;
+ import org.chromium.mojo.system.MojoException;
+@@ -110,6 +115,16 @@ public class NfcImpl implements Nfc {
+ 
+     private final List<Integer> mWatchIds = new ArrayList<Integer>();
+ 
++    /** Watch IDs registered through watchIsoDep(), in registration order. */
++    private final List<Integer> mIsoDepWatchIds = new ArrayList<Integer>();
++
++    /** The active eMRTD session handed to the client, if any. */
++    private @Nullable IsoDepSession mIsoDepSession;
++
++    /** Runs blocking ISO-DEP I/O (classification and transceive) in order, off the UI thread. */
++    private final SequencedTaskRunner mIsoDepTaskRunner =
++            PostTask.createSequencedTaskRunner(TaskTraits.USER_BLOCKING_MAY_BLOCK);
++
+     /** Vibrator. @see android.os.Vibrator */
+     private final Vibrator mVibrator;
+ 
+@@ -333,10 +348,42 @@ public class NfcImpl implements Nfc {
+             mWatchIds.remove(/* element */ Integer.valueOf(id));
+             disableReaderModeIfNeeded();
+         }
++        if (mIsoDepWatchIds.contains(id)) {
++            mIsoDepWatchIds.remove(/* element */ Integer.valueOf(id));
++            if (mIsoDepWatchIds.isEmpty()) closeIsoDepSession();
++            disableReaderModeIfNeeded();
++        }
++    }
++
++    /**
++     * Starts watching for eMRTD tags over ISO-DEP. A discovered tag that the browser classifies
++     * as an eMRTD is handed to the most recently registered watcher as an NfcIsoDepTag session.
++     *
++     * @param id request ID from Blink, sharing the numbering of watch().
++     * @param callback that is used to notify caller when watchIsoDep() is completed.
++     */
++    @Override
++    public void watchIsoDep(int id, WatchIsoDep_Response callback) {
++        NdefError error = checkIfReady();
++        if (error != null) {
++            callback.call(error);
++            return;
++        }
++        if (mWatchIds.contains(id) || mIsoDepWatchIds.contains(id)) {
++            callback.call(
++                    createError(
++                            NdefErrorType.NOT_READABLE,
++                            "Cannot start because the received scan request is duplicate."));
++            return;
++        }
++        mIsoDepWatchIds.add(id);
++        callback.call(null);
++        enableReaderModeIfNeeded();
+     }
+ 
+     @Override
+     public void close() {
++        closeIsoDepSession();
+         mDelegate.stopTrackingActivityForHost(mHostId);
+         disableReaderMode();
+     }
+@@ -350,6 +397,7 @@ public class NfcImpl implements Nfc {
+     /** Suspends all pending watch operations and cancel push / makeReadOnly operations. */
+     public void suspendNfcOperations() {
+         mOperationsSuspended = true;
++        closeIsoDepSession();
+         disableReaderMode();
+         cancelPush();
+         cancelMakeReadOnly();
+@@ -462,7 +510,8 @@ public class NfcImpl implements Nfc {
+     private boolean hasActiveOperations() {
+         return (mPendingPushOperation != null
+                 || mPendingMakeReadOnlyOperation != null
+-                || mWatchIds.size() != 0);
++                || mWatchIds.size() != 0
++                || mIsoDepWatchIds.size() != 0);
+     }
+ 
+     /**
+@@ -726,9 +775,98 @@ public class NfcImpl implements Nfc {
+             mVibrator.vibrate(200);
+         }
+         mTagDiscoveredLastTimeMs = now;
++
++        if (maybeHandleIsoDepTag(tag)) {
++            // A tag without NDEF support was taken by the ISO-DEP path; don't report it to NDEF
++            // readers as unsupported.
++            if (Ndef.get(tag) == null && NdefFormatable.get(tag) == null) return;
++        }
+         processPendingOperations(NfcTagHandler.create(tag));
+     }
+ 
++    /**
++     * Starts eMRTD classification for |tag| if there are ISO-DEP watchers and the tag supports
++     * ISO-DEP. Returns true if the tag was taken by the ISO-DEP path.
++     */
++    private boolean maybeHandleIsoDepTag(Tag tag) {
++        if (mIsoDepWatchIds.isEmpty() || mClient == null || mOperationsSuspended) return false;
++        if (NfcBlocklist.getInstance().isTagBlocked(tag)) return false;
++        IsoDep isoDep = IsoDep.get(tag);
++        if (isoDep == null) return false;
++
++        // A new tag replaces any previous session.
++        closeIsoDepSession();
++        mIsoDepTaskRunner.execute(
++                () -> {
++                    boolean isEmrtd = false;
++                    try {
++                        if (!isoDep.isConnected()) isoDep.connect();
++                        isoDep.setTimeout(5000);
++                        isEmrtd = EmrtdPolicy.isEmrtd(isoDep);
++                    } catch (IOException | IllegalStateException | SecurityException e) {
++                        Log.w(TAG, "ISO-DEP classification failed: " + e.getMessage());
++                    }
++                    if (!isEmrtd) {
++                        try {
++                            isoDep.close();
++                        } catch (IOException e) {
++                            // Ignored: the tag may already be out of range.
++                        }
++                    }
++                    final boolean finalIsEmrtd = isEmrtd;
++                    PostTask.postTask(
++                            TaskTraits.UI_USER_BLOCKING,
++                            () -> onIsoDepTagClassified(isoDep, finalIsEmrtd));
++                });
++        return true;
++    }
++
++    /** Hands a classified eMRTD tag to the most recent ISO-DEP watcher, or reports an error. */
++    private void onIsoDepTagClassified(IsoDep isoDep, boolean isEmrtd) {
++        if (mClient == null || mIsoDepWatchIds.isEmpty() || mOperationsSuspended) {
++            if (isEmrtd) {
++                try {
++                    isoDep.close();
++                } catch (IOException e) {
++                    // Ignored.
++                }
++            }
++            return;
++        }
++        if (!isEmrtd) {
++            mClient.onIsoDepError(
++                    CollectionUtil.integerCollectionToIntArray(mIsoDepWatchIds),
++                    createError(
++                            NdefErrorType.NOT_SUPPORTED,
++                            "This tag is not an identity document (eMRTD)."));
++            return;
++        }
++
++        NfcIsoDepTagInfo info = new NfcIsoDepTagInfo();
++        info.historicalBytes = isoDep.getHistoricalBytes();
++        info.maxTransceiveLength = isoDep.getMaxTransceiveLength();
++        info.extendedLengthApdu = isoDep.isExtendedLengthApduSupported();
++
++        IsoDepSession[] holder = new IsoDepSession[1];
++        IsoDepSession session =
++                new IsoDepSession(
++                        isoDep,
++                        mIsoDepTaskRunner,
++                        () -> {
++                            if (mIsoDepSession == holder[0]) mIsoDepSession = null;
++                        });
++        holder[0] = session;
++        mIsoDepSession = session;
++        int watchId = mIsoDepWatchIds.get(mIsoDepWatchIds.size() - 1);
++        mClient.onIsoDepTag(watchId, info, session);
++    }
++
++    private void closeIsoDepSession() {
++        IsoDepSession session = mIsoDepSession;
++        mIsoDepSession = null;
++        if (session != null) session.close();
++    }
++
+     /** Processes pending operation when NFC tag is in proximity. */
+     protected void processPendingOperations(@Nullable NfcTagHandler tagHandler) {
+         mTagHandler = tagHandler;
+diff --git a/services/device/public/cpp/test/scoped_nfc_overrider.cc b/services/device/public/cpp/test/scoped_nfc_overrider.cc
+index d76728c3fa..ea21572dd8 100644
+--- a/services/device/public/cpp/test/scoped_nfc_overrider.cc
++++ b/services/device/public/cpp/test/scoped_nfc_overrider.cc
+@@ -40,6 +40,9 @@ class FakeNFC : public mojom::NFC {
+     std::move(callback).Run(nullptr);
+   }
+   void CancelWatch(uint32_t id) override {}
++  void WatchIsoDep(uint32_t id, WatchIsoDepCallback callback) override {
++    std::move(callback).Run(nullptr);
++  }
+ 
+  private:
+   mojo::Receiver<mojom::NFC> receiver_{this};
+diff --git a/services/device/public/mojom/nfc.mojom b/services/device/public/mojom/nfc.mojom
+index 8d4cacda97..fb6872bdb6 100644
+--- a/services/device/public/mojom/nfc.mojom
++++ b/services/device/public/mojom/nfc.mojom
+@@ -132,6 +132,26 @@ struct NDEFRawMessage {
+   array<NDEFRawRecord> data;
+ };
+ 
++// Properties of an ISO-DEP (ISO/IEC 14443-4) tag exposed to NFCIsoDepReader.
++// Only tags the browser has classified as eMRTDs (ICAO Doc 9303) are exposed.
++struct NFCIsoDepTagInfo {
++  // Historical bytes from the ATS (NFC-A), or null if unavailable.
++  array<uint8>? historical_bytes;
++  // Maximum command APDU length accepted by Transceive().
++  uint32 max_transceive_length;
++  // Whether the tag accepts extended-length APDUs.
++  bool extended_length_apdu;
++};
++
++// A session with one eMRTD tag. The implementation filters commands so that
++// only the eMRTD application can be selected. Closing the pipe ends the
++// session.
++interface NFCIsoDepTag {
++  // Sends a command APDU and returns the response APDU (including SW1-SW2).
++  Transceive(array<uint8> command) => (array<uint8>? response,
++                                       NDEFError? error);
++};
++
+ struct NDEFWriteOptions {
+   // Only the case of |overwrite| being |false| matters: the push operation will
+   // read the NFC tag to determine if it has NDEF records on it, and if yes, do
+@@ -170,6 +190,11 @@ interface NFC {
+ 
+   // Cancels watch operation with provided id.
+   CancelWatch(uint32 id);
++
++  // Starts watching for nearby eMRTD tags over ISO-DEP. |id| shares the
++  // numbering space of Watch() and is cancelled with CancelWatch().
++  [EnableIfNot=is_ios_iphoneos]
++  WatchIsoDep(uint32 id) => (NDEFError? error);
+ };
+ 
+ // Interface that client of the NFC interface must implement to get notified of
+@@ -186,6 +211,14 @@ interface NFCClient {
+   // Sends |error| to all readers that are trying to read some data from the nfc
+   // tag coming nearby.
+   OnError(NDEFError error);
++
++  // Hands a session with a nearby eMRTD tag to the ISO-DEP reader registered
++  // with |watch_id| via NFC.WatchIsoDep().
++  OnIsoDepTag(uint32 watch_id, NFCIsoDepTagInfo info,
++              pending_remote<NFCIsoDepTag> tag);
++
++  // Reports an error to ISO-DEP readers, e.g. a tag that is not an eMRTD.
++  OnIsoDepError(array<uint32> watch_ids, NDEFError error);
+ };
+ 
+ // Interface that client of the NFC interface must implement to get notified of
+diff --git a/third_party/blink/renderer/bindings/generated_in_modules.gni b/third_party/blink/renderer/bindings/generated_in_modules.gni
+index 4eeb9fe7ca..635fdea23f 100644
+--- a/third_party/blink/renderer/bindings/generated_in_modules.gni
++++ b/third_party/blink/renderer/bindings/generated_in_modules.gni
+@@ -946,6 +946,8 @@ generated_dictionary_sources_in_modules = [
+   "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_ndef_scan_options.h",
+   "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_ndef_write_options.cc",
+   "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_ndef_write_options.h",
++  "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_nfc_iso_dep_scan_options.cc",
++  "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_nfc_iso_dep_scan_options.h",
+   "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_notification_action.cc",
+   "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_notification_action.h",
+   "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_notification_event_init.cc",
+@@ -1504,6 +1506,8 @@ if (enable_compute_pressure) {
+ }
+ 
+ generated_enumeration_sources_in_modules = [
++  "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_nfc_iso_dep_application.cc",
++  "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_nfc_iso_dep_application.h",
+   "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_aac_bitstream_format.cc",
+   "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_aac_bitstream_format.h",
+   "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_ad_signals.cc",
+@@ -2709,6 +2713,12 @@ generated_interface_sources_in_modules = [
+   "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_ndef_reader.h",
+   "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_ndef_reading_event.cc",
+   "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_ndef_reading_event.h",
++  "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_nfc_iso_dep_reader.cc",
++  "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_nfc_iso_dep_reader.h",
++  "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_nfc_iso_dep_reading_event.cc",
++  "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_nfc_iso_dep_reading_event.h",
++  "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_nfc_iso_dep_tag.cc",
++  "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_nfc_iso_dep_tag.h",
+   "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_ndef_record.cc",
+   "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_ndef_record.h",
+   "$root_gen_dir/third_party/blink/renderer/bindings/modules/v8/v8_network_information.cc",
+diff --git a/third_party/blink/renderer/bindings/idl_in_modules.gni b/third_party/blink/renderer/bindings/idl_in_modules.gni
+index 7e5ae95533..fb204fd8da 100644
+--- a/third_party/blink/renderer/bindings/idl_in_modules.gni
++++ b/third_party/blink/renderer/bindings/idl_in_modules.gni
+@@ -525,6 +525,10 @@ static_idl_files_in_modules = [
+   "//third_party/blink/renderer/modules/nfc/ndef_record_init.idl",
+   "//third_party/blink/renderer/modules/nfc/ndef_scan_options.idl",
+   "//third_party/blink/renderer/modules/nfc/ndef_write_options.idl",
++  "//third_party/blink/renderer/modules/nfc/nfc_iso_dep_reader.idl",
++  "//third_party/blink/renderer/modules/nfc/nfc_iso_dep_reading_event.idl",
++  "//third_party/blink/renderer/modules/nfc/nfc_iso_dep_scan_options.idl",
++  "//third_party/blink/renderer/modules/nfc/nfc_iso_dep_tag.idl",
+   "//third_party/blink/renderer/modules/notifications/get_notification_options.idl",
+   "//third_party/blink/renderer/modules/notifications/notification.idl",
+   "//third_party/blink/renderer/modules/notifications/notification_action.idl",
+diff --git a/third_party/blink/renderer/modules/event_target_modules_names.json5 b/third_party/blink/renderer/modules/event_target_modules_names.json5
+index 0d29450bf8..b37c9de410 100644
+--- a/third_party/blink/renderer/modules/event_target_modules_names.json5
++++ b/third_party/blink/renderer/modules/event_target_modules_names.json5
+@@ -48,6 +48,7 @@
+     "RTCTransport",
+     "RTCSctpTransport",
+     "NDEFReader",
++    "NFCIsoDepReader",
+     "NetworkInformation",
+     "Notification",
+     "PaymentRequest",
+diff --git a/third_party/blink/renderer/modules/nfc/BUILD.gn b/third_party/blink/renderer/modules/nfc/BUILD.gn
+index 6f8bc76a72..2b9e2236c6 100644
+--- a/third_party/blink/renderer/modules/nfc/BUILD.gn
++++ b/third_party/blink/renderer/modules/nfc/BUILD.gn
+@@ -15,6 +15,12 @@ blink_modules_sources("nfc") {
+     "ndef_reading_event.h",
+     "ndef_record.cc",
+     "ndef_record.h",
++    "nfc_iso_dep_reader.cc",
++    "nfc_iso_dep_reader.h",
++    "nfc_iso_dep_reading_event.cc",
++    "nfc_iso_dep_reading_event.h",
++    "nfc_iso_dep_tag.cc",
++    "nfc_iso_dep_tag.h",
+     "nfc_proxy.cc",
+     "nfc_proxy.h",
+     "nfc_type_converters.cc",
+diff --git a/third_party/blink/renderer/modules/nfc/nfc_iso_dep_reader.cc b/third_party/blink/renderer/modules/nfc/nfc_iso_dep_reader.cc
+new file mode 100644
+index 0000000000..2b7e75fc8d
+--- /dev/null
++++ b/third_party/blink/renderer/modules/nfc/nfc_iso_dep_reader.cc
+@@ -0,0 +1,235 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "third_party/blink/renderer/modules/nfc/nfc_iso_dep_reader.h"
++
++#include <utility>
++
++#include "build/build_config.h"
++
++#include "third_party/blink/public/mojom/permissions/permission_status.mojom-blink.h"
++#include "third_party/blink/renderer/bindings/core/v8/v8_binding_for_core.h"
++#include "third_party/blink/renderer/bindings/modules/v8/v8_nfc_iso_dep_scan_options.h"
++#include "third_party/blink/renderer/core/dom/dom_exception.h"
++#include "third_party/blink/renderer/core/frame/local_dom_window.h"
++#include "third_party/blink/renderer/core/frame/local_frame.h"
++#include "third_party/blink/renderer/core/inspector/console_message.h"
++#include "third_party/blink/renderer/modules/event_target_modules.h"
++#include "third_party/blink/renderer/modules/nfc/nfc_iso_dep_reading_event.h"
++#include "third_party/blink/renderer/modules/nfc/nfc_iso_dep_tag.h"
++#include "third_party/blink/renderer/modules/nfc/nfc_proxy.h"
++#include "third_party/blink/renderer/modules/permissions/permission_utils.h"
++#include "third_party/blink/renderer/platform/bindings/exception_state.h"
++#include "third_party/blink/renderer/platform/wtf/functional.h"
++
++namespace blink {
++
++using mojom::blink::PermissionName;
++using mojom::blink::PermissionService;
++
++class NFCIsoDepReader::ReadAbortAlgorithm final
++    : public AbortSignal::Algorithm {
++ public:
++  ReadAbortAlgorithm(NFCIsoDepReader* reader, AbortSignal* signal)
++      : reader_(reader), abort_signal_(signal) {}
++  ~ReadAbortAlgorithm() override = default;
++
++  void Run() override { reader_->ReadAbort(abort_signal_); }
++
++  void Trace(Visitor* visitor) const override {
++    visitor->Trace(reader_);
++    visitor->Trace(abort_signal_);
++    Algorithm::Trace(visitor);
++  }
++
++ private:
++  Member<NFCIsoDepReader> reader_;
++  Member<AbortSignal> abort_signal_;
++};
++
++// static
++NFCIsoDepReader* NFCIsoDepReader::Create(ExecutionContext* context) {
++  return MakeGarbageCollected<NFCIsoDepReader>(context);
++}
++
++NFCIsoDepReader::NFCIsoDepReader(ExecutionContext* context)
++    : ActiveScriptWrappable<NFCIsoDepReader>({}),
++      ExecutionContextLifecycleObserver(context),
++      nfc_proxy_(NFCProxy::From(*To<LocalDOMWindow>(context))),
++      permission_service_(context) {}
++
++NFCIsoDepReader::~NFCIsoDepReader() = default;
++
++const AtomicString& NFCIsoDepReader::InterfaceName() const {
++  return event_target_names::kNFCIsoDepReader;
++}
++
++ExecutionContext* NFCIsoDepReader::GetExecutionContext() const {
++  return ExecutionContextLifecycleObserver::GetExecutionContext();
++}
++
++bool NFCIsoDepReader::HasPendingActivity() const {
++  return GetExecutionContext() && nfc_proxy_->IsIsoDepReading(this) &&
++         HasEventListeners();
++}
++
++ScriptPromise<IDLUndefined> NFCIsoDepReader::scan(
++    ScriptState* script_state,
++    const NFCIsoDepScanOptions* options,
++    ExceptionState& exception_state) {
++  LocalDOMWindow* window = To<LocalDOMWindow>(GetExecutionContext());
++  // Like Web NFC, only the top-level browsing context may use the reader.
++  if (!window || !window->GetFrame() || !window->GetFrame()->IsMainFrame()) {
++    exception_state.ThrowDOMException(
++        DOMExceptionCode::kInvalidStateError,
++        "NFCIsoDepReader can only be used in a top-level browsing context.");
++    return EmptyPromise();
++  }
++
++  // Scanning requires a user gesture, so that a page cannot silently wait
++  // for an identity document to be presented.
++  if (!LocalFrame::HasTransientUserActivation(window->GetFrame())) {
++    exception_state.ThrowDOMException(
++        DOMExceptionCode::kNotAllowedError,
++        "scan() requires a user gesture.");
++    return EmptyPromise();
++  }
++
++  if (scan_signal_ && scan_abort_handle_) {
++    scan_signal_->RemoveAlgorithm(scan_abort_handle_);
++    scan_abort_handle_.Clear();
++  }
++  scan_signal_ = options->getSignalOr(nullptr);
++  if (scan_signal_) {
++    if (scan_signal_->aborted()) {
++      return ScriptPromise<IDLUndefined>::Reject(
++          script_state, scan_signal_->reason(script_state));
++    }
++    scan_abort_handle_ = scan_signal_->AddAlgorithm(
++        MakeGarbageCollected<ReadAbortAlgorithm>(this, scan_signal_));
++  }
++
++  if (scan_resolver_ || nfc_proxy_->IsIsoDepReading(this)) {
++    exception_state.ThrowDOMException(DOMExceptionCode::kInvalidStateError,
++                                      "A scan() operation is ongoing.");
++    return EmptyPromise();
++  }
++
++  scan_resolver_ = MakeGarbageCollected<ScriptPromiseResolver<IDLUndefined>>(
++      script_state, exception_state.GetContext());
++  GetPermissionService()->RequestPermission(
++      CreatePermissionDescriptor(PermissionName::NFC),
++      BindOnce(&NFCIsoDepReader::ReadOnRequestPermission,
++               WrapPersistent(this)));
++  return scan_resolver_->Promise();
++}
++
++void NFCIsoDepReader::ReadOnRequestPermission(
++    mojom::blink::PermissionStatusWithDetailsPtr status) {
++  if (!scan_resolver_) {
++    return;
++  }
++  if (status->status != mojom::blink::PermissionStatus::GRANTED) {
++    scan_resolver_->RejectWithDOMException(DOMExceptionCode::kNotAllowedError,
++                                           "NFC permission request denied.");
++    scan_resolver_.Clear();
++    return;
++  }
++#if BUILDFLAG(IS_IOS) && !BUILDFLAG(IS_IOS_TVOS)
++  // TODO: implement with Core NFC (NFCTagReaderSession / NFCISO7816Tag).
++  scan_resolver_->RejectWithDOMException(
++      DOMExceptionCode::kNotSupportedError,
++      "NFCIsoDepReader is not yet supported on this platform.");
++  scan_resolver_.Clear();
++#else
++  nfc_proxy_->StartIsoDepReading(
++      this,
++      BindOnce(&NFCIsoDepReader::ReadOnRequestCompleted, WrapPersistent(this)));
++#endif
++}
++
++void NFCIsoDepReader::ReadOnRequestCompleted(
++    device::mojom::blink::NDEFErrorPtr error) {
++  if (!scan_resolver_) {
++    return;
++  }
++  if (error) {
++    scan_resolver_->RejectWithDOMException(
++        NFCErrorTypeToDOMExceptionCode(error->error_type),
++        error->error_message);
++  } else {
++    scan_resolver_->Resolve();
++  }
++  scan_resolver_.Clear();
++}
++
++void NFCIsoDepReader::OnIsoDepTag(
++    device::mojom::blink::NFCIsoDepTagInfoPtr info,
++    mojo::PendingRemote<device::mojom::blink::NFCIsoDepTag> tag) {
++  auto* iso_dep_tag = MakeGarbageCollected<NFCIsoDepTag>(
++      GetExecutionContext(), std::move(info), std::move(tag));
++  DispatchEvent(*MakeGarbageCollected<NFCIsoDepReadingEvent>(
++      event_type_names::kReading, iso_dep_tag));
++}
++
++void NFCIsoDepReader::OnReadingError(const String& message) {
++  GetExecutionContext()->AddConsoleMessage(MakeGarbageCollected<ConsoleMessage>(
++      mojom::blink::ConsoleMessageSource::kJavaScript,
++      mojom::blink::ConsoleMessageLevel::kInfo, message));
++  DispatchEvent(*Event::Create(event_type_names::kReadingerror));
++}
++
++void NFCIsoDepReader::ReadOnMojoConnectionError() {
++  if (!scan_resolver_) {
++    return;
++  }
++  scan_resolver_->RejectWithDOMException(
++      DOMExceptionCode::kNotSupportedError,
++      "Web NFC is unavailable or permission denied.");
++  scan_resolver_.Clear();
++}
++
++void NFCIsoDepReader::ContextDestroyed() {
++  nfc_proxy_->StopIsoDepReading(this);
++  scan_abort_handle_.Clear();
++}
++
++void NFCIsoDepReader::ReadAbort(AbortSignal* signal) {
++  nfc_proxy_->StopIsoDepReading(this);
++  scan_abort_handle_.Clear();
++  if (!scan_resolver_) {
++    return;
++  }
++  ScriptState* script_state = scan_resolver_->GetScriptState();
++  ScriptState::Scope script_state_scope(script_state);
++  scan_resolver_->Reject(signal->reason(script_state));
++  scan_resolver_.Clear();
++}
++
++void NFCIsoDepReader::Dispose() {
++  nfc_proxy_->StopIsoDepReading(this);
++}
++
++PermissionService* NFCIsoDepReader::GetPermissionService() {
++  if (!permission_service_.is_bound()) {
++    ConnectToPermissionService(
++        GetExecutionContext(),
++        permission_service_.BindNewPipeAndPassReceiver(
++            GetExecutionContext()->GetTaskRunner(TaskType::kMiscPlatformAPI)));
++  }
++  return permission_service_.get();
++}
++
++void NFCIsoDepReader::Trace(Visitor* visitor) const {
++  visitor->Trace(nfc_proxy_);
++  visitor->Trace(scan_resolver_);
++  visitor->Trace(scan_signal_);
++  visitor->Trace(scan_abort_handle_);
++  visitor->Trace(permission_service_);
++  EventTarget::Trace(visitor);
++  ActiveScriptWrappable::Trace(visitor);
++  ExecutionContextLifecycleObserver::Trace(visitor);
++}
++
++}  // namespace blink
+diff --git a/third_party/blink/renderer/modules/nfc/nfc_iso_dep_reader.h b/third_party/blink/renderer/modules/nfc/nfc_iso_dep_reader.h
+new file mode 100644
+index 0000000000..0f6d944eea
+--- /dev/null
++++ b/third_party/blink/renderer/modules/nfc/nfc_iso_dep_reader.h
+@@ -0,0 +1,86 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef THIRD_PARTY_BLINK_RENDERER_MODULES_NFC_NFC_ISO_DEP_READER_H_
++#define THIRD_PARTY_BLINK_RENDERER_MODULES_NFC_NFC_ISO_DEP_READER_H_
++
++#include "mojo/public/cpp/bindings/pending_remote.h"
++#include "services/device/public/mojom/nfc.mojom-blink.h"
++#include "third_party/blink/public/mojom/permissions/permission.mojom-blink.h"
++#include "third_party/blink/renderer/bindings/core/v8/active_script_wrappable.h"
++#include "third_party/blink/renderer/bindings/core/v8/script_promise.h"
++#include "third_party/blink/renderer/bindings/core/v8/script_promise_resolver.h"
++#include "third_party/blink/renderer/core/dom/abort_signal.h"
++#include "third_party/blink/renderer/core/dom/events/event_target.h"
++#include "third_party/blink/renderer/core/execution_context/execution_context_lifecycle_observer.h"
++#include "third_party/blink/renderer/modules/modules_export.h"
++#include "third_party/blink/renderer/platform/heap/garbage_collected.h"
++#include "third_party/blink/renderer/platform/mojo/heap_mojo_remote.h"
++
++namespace blink {
++
++class ExceptionState;
++class NFCIsoDepScanOptions;
++class NFCProxy;
++class ScriptState;
++
++// Prototype reader for ISO-DEP identity documents (ICAO Doc 9303 eMRTDs).
++class MODULES_EXPORT NFCIsoDepReader
++    : public EventTarget,
++      public ActiveScriptWrappable<NFCIsoDepReader>,
++      public ExecutionContextLifecycleObserver {
++  DEFINE_WRAPPERTYPEINFO();
++  USING_PRE_FINALIZER(NFCIsoDepReader, Dispose);
++
++ public:
++  static NFCIsoDepReader* Create(ExecutionContext*);
++
++  explicit NFCIsoDepReader(ExecutionContext*);
++  ~NFCIsoDepReader() override;
++
++  // EventTarget overrides.
++  const AtomicString& InterfaceName() const override;
++  ExecutionContext* GetExecutionContext() const override;
++
++  // ActiveScriptWrappable overrides.
++  bool HasPendingActivity() const override;
++
++  DEFINE_ATTRIBUTE_EVENT_LISTENER(reading, kReading)
++  DEFINE_ATTRIBUTE_EVENT_LISTENER(readingerror, kReadingerror)
++
++  ScriptPromise<IDLUndefined> scan(ScriptState*,
++                                   const NFCIsoDepScanOptions*,
++                                   ExceptionState&);
++
++  void Trace(Visitor*) const override;
++  void Dispose();
++
++  // Called by NFCProxy.
++  void OnIsoDepTag(device::mojom::blink::NFCIsoDepTagInfoPtr,
++                   mojo::PendingRemote<device::mojom::blink::NFCIsoDepTag>);
++  void OnReadingError(const String& message);
++  void ReadOnMojoConnectionError();
++
++ private:
++  class ReadAbortAlgorithm;
++
++  // ExecutionContextLifecycleObserver overrides.
++  void ContextDestroyed() override;
++
++  void ReadAbort(AbortSignal*);
++  void ReadOnRequestPermission(mojom::blink::PermissionStatusWithDetailsPtr);
++  void ReadOnRequestCompleted(device::mojom::blink::NDEFErrorPtr);
++
++  mojom::blink::PermissionService* GetPermissionService();
++
++  Member<NFCProxy> nfc_proxy_;
++  Member<ScriptPromiseResolver<IDLUndefined>> scan_resolver_;
++  Member<AbortSignal> scan_signal_;
++  Member<AbortSignal::AlgorithmHandle> scan_abort_handle_;
++  HeapMojoRemote<mojom::blink::PermissionService> permission_service_;
++};
++
++}  // namespace blink
++
++#endif  // THIRD_PARTY_BLINK_RENDERER_MODULES_NFC_NFC_ISO_DEP_READER_H_
+diff --git a/third_party/blink/renderer/modules/nfc/nfc_iso_dep_reader.idl b/third_party/blink/renderer/modules/nfc/nfc_iso_dep_reader.idl
+new file mode 100644
+index 0000000000..ac92c673f9
+--- /dev/null
++++ b/third_party/blink/renderer/modules/nfc/nfc_iso_dep_reader.idl
+@@ -0,0 +1,18 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// Prototype: ISO-DEP access to identity documents (ICAO Doc 9303 eMRTDs).
++[
++    RuntimeEnabled=WebNFCIsoDep,
++    ActiveScriptWrappable,
++    SecureContext,
++    Exposed=Window
++] interface NFCIsoDepReader : EventTarget {
++    [CallWith=ExecutionContext] constructor();
++    attribute EventHandler onreading;
++    attribute EventHandler onreadingerror;
++
++    [CallWith=ScriptState, RaisesException] Promise<undefined> scan(
++        optional NFCIsoDepScanOptions options = {});
++};
+diff --git a/third_party/blink/renderer/modules/nfc/nfc_iso_dep_reading_event.cc b/third_party/blink/renderer/modules/nfc/nfc_iso_dep_reading_event.cc
+new file mode 100644
+index 0000000000..9134922e36
+--- /dev/null
++++ b/third_party/blink/renderer/modules/nfc/nfc_iso_dep_reading_event.cc
+@@ -0,0 +1,30 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "third_party/blink/renderer/modules/nfc/nfc_iso_dep_reading_event.h"
++
++#include "third_party/blink/renderer/modules/nfc/nfc_iso_dep_tag.h"
++
++namespace blink {
++
++NFCIsoDepReadingEvent::NFCIsoDepReadingEvent(const AtomicString& type,
++                                             NFCIsoDepTag* tag)
++    : Event(type, Bubbles::kNo, Cancelable::kNo), tag_(tag) {}
++
++NFCIsoDepReadingEvent::~NFCIsoDepReadingEvent() = default;
++
++const AtomicString& NFCIsoDepReadingEvent::InterfaceName() const {
++  return event_interface_names::kNFCIsoDepReadingEvent;
++}
++
++void NFCIsoDepReadingEvent::Trace(Visitor* visitor) const {
++  visitor->Trace(tag_);
++  Event::Trace(visitor);
++}
++
++NFCIsoDepTag* NFCIsoDepReadingEvent::tag() const {
++  return tag_.Get();
++}
++
++}  // namespace blink
+diff --git a/third_party/blink/renderer/modules/nfc/nfc_iso_dep_reading_event.h b/third_party/blink/renderer/modules/nfc/nfc_iso_dep_reading_event.h
+new file mode 100644
+index 0000000000..5f3776775f
+--- /dev/null
++++ b/third_party/blink/renderer/modules/nfc/nfc_iso_dep_reading_event.h
+@@ -0,0 +1,33 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef THIRD_PARTY_BLINK_RENDERER_MODULES_NFC_NFC_ISO_DEP_READING_EVENT_H_
++#define THIRD_PARTY_BLINK_RENDERER_MODULES_NFC_NFC_ISO_DEP_READING_EVENT_H_
++
++#include "third_party/blink/renderer/modules/event_modules.h"
++#include "third_party/blink/renderer/platform/heap/garbage_collected.h"
++
++namespace blink {
++
++class NFCIsoDepTag;
++
++class NFCIsoDepReadingEvent final : public Event {
++  DEFINE_WRAPPERTYPEINFO();
++
++ public:
++  NFCIsoDepReadingEvent(const AtomicString& type, NFCIsoDepTag* tag);
++  ~NFCIsoDepReadingEvent() override;
++
++  const AtomicString& InterfaceName() const override;
++  void Trace(Visitor*) const override;
++
++  NFCIsoDepTag* tag() const;
++
++ private:
++  Member<NFCIsoDepTag> tag_;
++};
++
++}  // namespace blink
++
++#endif  // THIRD_PARTY_BLINK_RENDERER_MODULES_NFC_NFC_ISO_DEP_READING_EVENT_H_
+diff --git a/third_party/blink/renderer/modules/nfc/nfc_iso_dep_reading_event.idl b/third_party/blink/renderer/modules/nfc/nfc_iso_dep_reading_event.idl
+new file mode 100644
+index 0000000000..4950d7f71a
+--- /dev/null
++++ b/third_party/blink/renderer/modules/nfc/nfc_iso_dep_reading_event.idl
+@@ -0,0 +1,11 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++[
++    RuntimeEnabled=WebNFCIsoDep,
++    SecureContext,
++    Exposed=Window
++] interface NFCIsoDepReadingEvent : Event {
++    [SameObject] readonly attribute NFCIsoDepTag tag;
++};
+diff --git a/third_party/blink/renderer/modules/nfc/nfc_iso_dep_scan_options.idl b/third_party/blink/renderer/modules/nfc/nfc_iso_dep_scan_options.idl
+new file mode 100644
+index 0000000000..a55fcfe2a2
+--- /dev/null
++++ b/third_party/blink/renderer/modules/nfc/nfc_iso_dep_scan_options.idl
+@@ -0,0 +1,11 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++enum NFCIsoDepApplication { "emrtd" };
++
++dictionary NFCIsoDepScanOptions {
++    AbortSignal? signal;
++    // Absent means ["emrtd"]; "emrtd" is currently the only application.
++    sequence<NFCIsoDepApplication> applications;
++};
+diff --git a/third_party/blink/renderer/modules/nfc/nfc_iso_dep_tag.cc b/third_party/blink/renderer/modules/nfc/nfc_iso_dep_tag.cc
+new file mode 100644
+index 0000000000..7746959723
+--- /dev/null
++++ b/third_party/blink/renderer/modules/nfc/nfc_iso_dep_tag.cc
+@@ -0,0 +1,148 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "third_party/blink/renderer/modules/nfc/nfc_iso_dep_tag.h"
++
++#include <utility>
++
++#include "third_party/blink/renderer/core/execution_context/execution_context.h"
++#include "third_party/blink/renderer/core/typed_arrays/dom_array_piece.h"
++#include "third_party/blink/renderer/platform/bindings/exception_state.h"
++#include "third_party/blink/renderer/platform/bindings/script_state.h"
++#include "third_party/blink/renderer/platform/wtf/functional.h"
++
++namespace blink {
++
++DOMExceptionCode NFCErrorTypeToDOMExceptionCode(
++    device::mojom::blink::NDEFErrorType error_type) {
++  switch (error_type) {
++    case device::mojom::blink::NDEFErrorType::NOT_ALLOWED:
++      return DOMExceptionCode::kNotAllowedError;
++    case device::mojom::blink::NDEFErrorType::NOT_SUPPORTED:
++      return DOMExceptionCode::kNotSupportedError;
++    case device::mojom::blink::NDEFErrorType::NOT_READABLE:
++      return DOMExceptionCode::kNotReadableError;
++    case device::mojom::blink::NDEFErrorType::INVALID_MESSAGE:
++      return DOMExceptionCode::kSyntaxError;
++    case device::mojom::blink::NDEFErrorType::OPERATION_CANCELLED:
++      return DOMExceptionCode::kAbortError;
++    case device::mojom::blink::NDEFErrorType::IO_ERROR:
++      return DOMExceptionCode::kNetworkError;
++  }
++  NOTREACHED();
++}
++
++NFCIsoDepTag::NFCIsoDepTag(
++    ExecutionContext* context,
++    device::mojom::blink::NFCIsoDepTagInfoPtr info,
++    mojo::PendingRemote<device::mojom::blink::NFCIsoDepTag> tag)
++    : remote_(context) {
++  if (info->historical_bytes) {
++    historical_bytes_ =
++        NotShared(DOMUint8Array::Create(base::span(*info->historical_bytes)));
++  }
++  max_transceive_length_ = info->max_transceive_length;
++  extended_length_apdu_ = info->extended_length_apdu;
++
++  remote_.Bind(std::move(tag),
++               context->GetTaskRunner(TaskType::kMiscPlatformAPI));
++  remote_.set_disconnect_handler(
++      BindOnce(&NFCIsoDepTag::OnConnectionError, WrapWeakPersistent(this)));
++}
++
++NFCIsoDepTag::~NFCIsoDepTag() = default;
++
++NotShared<DOMUint8Array> NFCIsoDepTag::historicalBytes() const {
++  return historical_bytes_;
++}
++
++ScriptPromise<NotShared<DOMUint8Array>> NFCIsoDepTag::transceive(
++    ScriptState* script_state,
++    const V8BufferSource* command_apdu,
++    ExceptionState& exception_state) {
++  if (closed_ || !remote_.is_bound()) {
++    exception_state.ThrowDOMException(DOMExceptionCode::kInvalidStateError,
++                                      "The tag session is closed.");
++    return EmptyPromise();
++  }
++
++  DOMArrayPiece piece(command_apdu);
++  if (piece.IsDetached() || piece.ByteLength() < 4) {
++    exception_state.ThrowTypeError("A command APDU is at least 4 bytes.");
++    return EmptyPromise();
++  }
++  if (piece.ByteLength() > max_transceive_length_) {
++    exception_state.ThrowDOMException(
++        DOMExceptionCode::kSyntaxError,
++        "The command APDU exceeds maxTransceiveLength.");
++    return EmptyPromise();
++  }
++  Vector<uint8_t> apdu(base::span<const uint8_t>(piece.ByteSpan()));
++
++  auto* resolver = MakeGarbageCollected<TransceiveResolver>(
++      script_state, exception_state.GetContext());
++  pending_.insert(resolver);
++  remote_->Transceive(
++      std::move(apdu),
++      BindOnce(&NFCIsoDepTag::OnTransceiveResponse, WrapPersistent(this),
++               WrapPersistent(resolver)));
++  return resolver->Promise();
++}
++
++ScriptPromise<IDLUndefined> NFCIsoDepTag::close(ScriptState* script_state) {
++  if (!closed_) {
++    closed_ = true;
++    remote_.reset();
++    RejectPending(DOMExceptionCode::kAbortError, "The tag session was closed.");
++  }
++  return ToResolvedUndefinedPromise(script_state);
++}
++
++void NFCIsoDepTag::OnTransceiveResponse(
++    TransceiveResolver* resolver,
++    const std::optional<Vector<uint8_t>>& response,
++    device::mojom::blink::NDEFErrorPtr error) {
++  if (!pending_.Contains(resolver)) {
++    return;
++  }
++  pending_.erase(resolver);
++  if (error) {
++    resolver->RejectWithDOMException(
++        NFCErrorTypeToDOMExceptionCode(error->error_type),
++        error->error_message);
++    return;
++  }
++  if (!response) {
++    resolver->RejectWithDOMException(DOMExceptionCode::kNetworkError,
++                                     "No response from the tag.");
++    return;
++  }
++  resolver->Resolve(NotShared(DOMUint8Array::Create(base::span(*response))));
++}
++
++void NFCIsoDepTag::OnConnectionError() {
++  closed_ = true;
++  remote_.reset();
++  RejectPending(DOMExceptionCode::kNetworkError,
++                "The tag was removed or the session ended.");
++}
++
++void NFCIsoDepTag::RejectPending(DOMExceptionCode code,
++                                 const String& message) {
++  // Rejecting may run script; swap first to avoid concurrent modification.
++  HeapHashSet<Member<TransceiveResolver>> pending;
++  pending_.swap(pending);
++  for (auto& resolver : pending) {
++    resolver->RejectWithDOMException(code, message);
++  }
++}
++
++void NFCIsoDepTag::Trace(Visitor* visitor) const {
++  visitor->Trace(historical_bytes_);
++  visitor->Trace(remote_);
++  visitor->Trace(pending_);
++  ScriptWrappable::Trace(visitor);
++}
++
++}  // namespace blink
+diff --git a/third_party/blink/renderer/modules/nfc/nfc_iso_dep_tag.h b/third_party/blink/renderer/modules/nfc/nfc_iso_dep_tag.h
+new file mode 100644
+index 0000000000..344fb1961e
+--- /dev/null
++++ b/third_party/blink/renderer/modules/nfc/nfc_iso_dep_tag.h
+@@ -0,0 +1,74 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef THIRD_PARTY_BLINK_RENDERER_MODULES_NFC_NFC_ISO_DEP_TAG_H_
++#define THIRD_PARTY_BLINK_RENDERER_MODULES_NFC_NFC_ISO_DEP_TAG_H_
++
++#include "mojo/public/cpp/bindings/pending_remote.h"
++#include "services/device/public/mojom/nfc.mojom-blink.h"
++#include "third_party/blink/renderer/bindings/core/v8/script_promise.h"
++#include "third_party/blink/renderer/bindings/core/v8/script_promise_resolver.h"
++#include "third_party/blink/renderer/bindings/modules/v8/v8_typedefs.h"
++#include "third_party/blink/renderer/core/dom/dom_exception.h"
++#include "third_party/blink/renderer/core/typed_arrays/dom_typed_array.h"
++#include "third_party/blink/renderer/modules/modules_export.h"
++#include "third_party/blink/renderer/platform/bindings/script_wrappable.h"
++#include "third_party/blink/renderer/platform/heap/collection_support/heap_hash_set.h"
++#include "third_party/blink/renderer/platform/heap/garbage_collected.h"
++#include "third_party/blink/renderer/platform/mojo/heap_mojo_remote.h"
++
++namespace blink {
++
++class ExceptionState;
++class ExecutionContext;
++class ScriptState;
++
++// Maps a device NDEFErrorType to the DOMException code used by Web NFC.
++DOMExceptionCode NFCErrorTypeToDOMExceptionCode(
++    device::mojom::blink::NDEFErrorType);
++
++// A session with one eMRTD tag, handed out by NFCIsoDepReader. The browser
++// process enforces which commands may reach the tag.
++class MODULES_EXPORT NFCIsoDepTag final : public ScriptWrappable {
++  DEFINE_WRAPPERTYPEINFO();
++
++ public:
++  NFCIsoDepTag(ExecutionContext*,
++               device::mojom::blink::NFCIsoDepTagInfoPtr,
++               mojo::PendingRemote<device::mojom::blink::NFCIsoDepTag>);
++  ~NFCIsoDepTag() override;
++
++  NotShared<DOMUint8Array> historicalBytes() const;
++  uint32_t maxTransceiveLength() const { return max_transceive_length_; }
++  bool extendedLengthApdu() const { return extended_length_apdu_; }
++
++  ScriptPromise<NotShared<DOMUint8Array>> transceive(
++      ScriptState*,
++      const V8BufferSource* command_apdu,
++      ExceptionState&);
++  ScriptPromise<IDLUndefined> close(ScriptState*);
++
++  void Trace(Visitor*) const override;
++
++ private:
++  using TransceiveResolver = ScriptPromiseResolver<NotShared<DOMUint8Array>>;
++
++  void OnTransceiveResponse(TransceiveResolver*,
++                            const std::optional<Vector<uint8_t>>& response,
++                            device::mojom::blink::NDEFErrorPtr error);
++  void OnConnectionError();
++  void RejectPending(DOMExceptionCode, const String& message);
++
++  NotShared<DOMUint8Array> historical_bytes_;
++  uint32_t max_transceive_length_ = 0;
++  bool extended_length_apdu_ = false;
++  bool closed_ = false;
++
++  HeapMojoRemote<device::mojom::blink::NFCIsoDepTag> remote_;
++  HeapHashSet<Member<TransceiveResolver>> pending_;
++};
++
++}  // namespace blink
++
++#endif  // THIRD_PARTY_BLINK_RENDERER_MODULES_NFC_NFC_ISO_DEP_TAG_H_
+diff --git a/third_party/blink/renderer/modules/nfc/nfc_iso_dep_tag.idl b/third_party/blink/renderer/modules/nfc/nfc_iso_dep_tag.idl
+new file mode 100644
+index 0000000000..ec2d440811
+--- /dev/null
++++ b/third_party/blink/renderer/modules/nfc/nfc_iso_dep_tag.idl
+@@ -0,0 +1,17 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++[
++    RuntimeEnabled=WebNFCIsoDep,
++    SecureContext,
++    Exposed=Window
++] interface NFCIsoDepTag {
++    readonly attribute Uint8Array? historicalBytes;
++    readonly attribute unsigned long maxTransceiveLength;
++    readonly attribute boolean extendedLengthApdu;
++
++    [CallWith=ScriptState, RaisesException] Promise<Uint8Array> transceive(
++        BufferSource commandApdu);
++    [CallWith=ScriptState] Promise<undefined> close();
++};
+diff --git a/third_party/blink/renderer/modules/nfc/nfc_proxy.cc b/third_party/blink/renderer/modules/nfc/nfc_proxy.cc
+index ba60dcaa21..0dee85f203 100644
+--- a/third_party/blink/renderer/modules/nfc/nfc_proxy.cc
++++ b/third_party/blink/renderer/modules/nfc/nfc_proxy.cc
+@@ -10,6 +10,7 @@
+ #include "third_party/blink/renderer/core/frame/local_dom_window.h"
+ #include "third_party/blink/renderer/core/page/page.h"
+ #include "third_party/blink/renderer/modules/nfc/ndef_reader.h"
++#include "third_party/blink/renderer/modules/nfc/nfc_iso_dep_reader.h"
+ #include "third_party/blink/renderer/modules/nfc/nfc_type_converters.h"
+ 
+ #if BUILDFLAG(IS_IOS) && !BUILDFLAG(IS_IOS_TVOS)
+@@ -44,6 +45,7 @@ void NFCProxy::Trace(Visitor* visitor) const {
+   visitor->Trace(nfc_remote_);
+   visitor->Trace(writers_);
+   visitor->Trace(readers_);
++  visitor->Trace(iso_dep_readers_);
+   Supplement<LocalDOMWindow>::Trace(visitor);
+ }
+ 
+@@ -77,6 +79,40 @@ bool NFCProxy::IsReading(const NDEFReader* reader) {
+   return readers_.Contains(const_cast<NDEFReader*>(reader));
+ }
+ 
++#if !(BUILDFLAG(IS_IOS) && !BUILDFLAG(IS_IOS_TVOS))
++void NFCProxy::StartIsoDepReading(
++    NFCIsoDepReader* reader,
++    device::mojom::blink::NFC::WatchIsoDepCallback callback) {
++  DCHECK(reader);
++  DCHECK(!iso_dep_readers_.Contains(reader));
++
++  EnsureMojoConnection();
++  nfc_remote_->WatchIsoDep(
++      next_watch_id_,
++      blink::BindOnce(&NFCProxy::OnIsoDepReaderRegistered, WrapPersistent(this),
++                      WrapPersistent(reader), next_watch_id_,
++                      std::move(callback)));
++  iso_dep_readers_.insert(reader, next_watch_id_);
++  next_watch_id_++;
++}
++#endif
++
++void NFCProxy::StopIsoDepReading(NFCIsoDepReader* reader) {
++  DCHECK(reader);
++  auto iter = iso_dep_readers_.find(reader);
++  if (iter != iso_dep_readers_.end()) {
++    if (nfc_remote_) {
++      nfc_remote_->CancelWatch(iter->value);
++    }
++    iso_dep_readers_.erase(iter);
++  }
++}
++
++bool NFCProxy::IsIsoDepReading(const NFCIsoDepReader* reader) {
++  DCHECK(reader);
++  return iso_dep_readers_.Contains(const_cast<NFCIsoDepReader*>(reader));
++}
++
+ void NFCProxy::AddWriter(NDEFReader* writer) {
+   if (!writers_.Contains(writer))
+     writers_.insert(writer);
+@@ -150,6 +186,48 @@ void NFCProxy::OnError(device::mojom::blink::NDEFErrorPtr error) {
+   }
+ }
+ 
++#if !(BUILDFLAG(IS_IOS) && !BUILDFLAG(IS_IOS_TVOS))
++void NFCProxy::OnIsoDepTag(
++    uint32_t watch_id,
++    device::mojom::blink::NFCIsoDepTagInfoPtr info,
++    mojo::PendingRemote<device::mojom::blink::NFCIsoDepTag> tag) {
++  IsoDepReaderMap copy = iso_dep_readers_;
++  for (auto& pair : copy) {
++    if (pair.value == watch_id) {
++      pair.key->OnIsoDepTag(std::move(info), std::move(tag));
++      return;
++    }
++  }
++  // No matching reader: dropping |tag| closes the session in the browser.
++}
++
++void NFCProxy::OnIsoDepError(const Vector<uint32_t>& watch_ids,
++                             device::mojom::blink::NDEFErrorPtr error) {
++  IsoDepReaderMap copy = iso_dep_readers_;
++  for (auto& pair : copy) {
++    if (watch_ids.Contains(pair.value)) {
++      pair.key->OnReadingError(error->error_message);
++    }
++  }
++}
++
++void NFCProxy::OnIsoDepReaderRegistered(
++    NFCIsoDepReader* reader,
++    uint32_t watch_id,
++    device::mojom::blink::NFC::WatchIsoDepCallback callback,
++    device::mojom::blink::NDEFErrorPtr error) {
++  DCHECK(reader);
++  if (!iso_dep_readers_.Contains(reader) ||
++      iso_dep_readers_.at(reader) != watch_id) {
++    return;
++  }
++  if (error) {
++    iso_dep_readers_.erase(reader);
++  }
++  std::move(callback).Run(std::move(error));
++}
++#endif
++
+ void NFCProxy::OnReaderRegistered(
+     NDEFReader* reader,
+     uint32_t watch_id,
+@@ -212,6 +290,10 @@ void NFCProxy::OnMojoConnectionError() {
+   for (auto& pair : readers) {
+     pair.key->ReadOnMojoConnectionError();
+   }
++  IsoDepReaderMap iso_dep_readers = std::move(iso_dep_readers_);
++  for (auto& pair : iso_dep_readers) {
++    pair.key->ReadOnMojoConnectionError();
++  }
+ 
+   // Each connection maintains its own watch ID numbering, so reset to 1 on
+   // connection error.
+diff --git a/third_party/blink/renderer/modules/nfc/nfc_proxy.h b/third_party/blink/renderer/modules/nfc/nfc_proxy.h
+index fe06118bfb..036137e41b 100644
+--- a/third_party/blink/renderer/modules/nfc/nfc_proxy.h
++++ b/third_party/blink/renderer/modules/nfc/nfc_proxy.h
+@@ -19,6 +19,7 @@ namespace blink {
+ 
+ class LocalDOMWindow;
+ class NDEFReader;
++class NFCIsoDepReader;
+ 
+ #if BUILDFLAG(IS_IOS) && !BUILDFLAG(IS_IOS_TVOS)
+ using NFCClientType = device::mojom::blink::RawNFCClient;
+@@ -56,6 +57,14 @@ class MODULES_EXPORT NFCProxy final : public GarbageCollected<NFCProxy>,
+   void MakeReadOnly(device::mojom::blink::NFC::MakeReadOnlyCallback);
+   void CancelMakeReadOnly();
+ 
++#if !(BUILDFLAG(IS_IOS) && !BUILDFLAG(IS_IOS_TVOS))
++  // ISO-DEP (eMRTD) readers. Watch IDs share |next_watch_id_| with NDEF.
++  void StartIsoDepReading(NFCIsoDepReader*,
++                          device::mojom::blink::NFC::WatchIsoDepCallback);
++#endif
++  void StopIsoDepReading(NFCIsoDepReader*);
++  bool IsIsoDepReading(const NFCIsoDepReader*);
++
+  private:
+   void NotifyWatchers(const Vector<uint32_t>& watch_ids,
+                       const String& serial_number,
+@@ -72,6 +81,19 @@ class MODULES_EXPORT NFCProxy final : public GarbageCollected<NFCProxy>,
+                device::mojom::blink::NDEFMessagePtr) override;
+ #endif
+   void OnError(device::mojom::blink::NDEFErrorPtr) override;
++#if !(BUILDFLAG(IS_IOS) && !BUILDFLAG(IS_IOS_TVOS))
++  void OnIsoDepTag(
++      uint32_t watch_id,
++      device::mojom::blink::NFCIsoDepTagInfoPtr,
++      mojo::PendingRemote<device::mojom::blink::NFCIsoDepTag>) override;
++  void OnIsoDepError(const Vector<uint32_t>& watch_ids,
++                     device::mojom::blink::NDEFErrorPtr) override;
++  void OnIsoDepReaderRegistered(
++      NFCIsoDepReader*,
++      uint32_t watch_id,
++      device::mojom::blink::NFC::WatchIsoDepCallback,
++      device::mojom::blink::NDEFErrorPtr);
++#endif
+ 
+   void OnReaderRegistered(NDEFReader*,
+                           uint32_t watch_id,
+@@ -92,6 +114,9 @@ class MODULES_EXPORT NFCProxy final : public GarbageCollected<NFCProxy>,
+   using ReaderMap = HeapHashMap<WeakMember<NDEFReader>, uint32_t>;
+   ReaderMap readers_;
+ 
++  using IsoDepReaderMap = HeapHashMap<WeakMember<NFCIsoDepReader>, uint32_t>;
++  IsoDepReaderMap iso_dep_readers_;
++
+   using WriterSet = HeapHashSet<WeakMember<NDEFReader>>;
+   WriterSet writers_;
+ 
+diff --git a/third_party/blink/renderer/modules/nfc/nfc_proxy_test.cc b/third_party/blink/renderer/modules/nfc/nfc_proxy_test.cc
+index e8eca23453..5a28f3b616 100644
+--- a/third_party/blink/renderer/modules/nfc/nfc_proxy_test.cc
++++ b/third_party/blink/renderer/modules/nfc/nfc_proxy_test.cc
+@@ -146,6 +146,11 @@ class FakeNfcService : public device::mojom::blink::NFC {
+     if (index != kNotFound)
+       watchIDs_.EraseAt(index);
+   }
++#if !(BUILDFLAG(IS_IOS) && !BUILDFLAG(IS_IOS_TVOS))
++  void WatchIsoDep(uint32_t id, WatchIsoDepCallback callback) override {
++    std::move(callback).Run(nullptr);
++  }
++#endif
+ 
+   device::mojom::blink::NDEFErrorPtr watch_error_;
+   device::mojom::blink::NDEFMessagePtr tag_message_;
+diff --git a/third_party/blink/renderer/platform/runtime_enabled_features.json5 b/third_party/blink/renderer/platform/runtime_enabled_features.json5
+index 247daac33b..818db6c190 100644
+--- a/third_party/blink/renderer/platform/runtime_enabled_features.json5
++++ b/third_party/blink/renderer/platform/runtime_enabled_features.json5
+@@ -7298,6 +7298,15 @@
+       status: {"Android": "stable", "iOS": "stable", "default": "test"},
+       base_feature: "none",
+     },
++    {
++      // Prototype: NFCIsoDepReader, ISO-DEP access to identity documents
++      // (ICAO Doc 9303 eMRTDs). Enable with Experimental Web Platform
++      // features.
++      name: "WebNFCIsoDep",
++      status: "experimental",
++      depends_on: ["WebNFC"],
++      base_feature: "none",
++    },
+     {
+       name: "WebOTP",
+       public: true,
+-- 
+2.43.0
+

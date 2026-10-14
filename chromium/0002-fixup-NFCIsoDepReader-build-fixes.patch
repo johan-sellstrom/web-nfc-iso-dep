@@ -1,0 +1,39 @@
+From a08d6d2e0d0d280dff5f716eb45c9883e8a92d05 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Johan=20Sellstr=C3=B6m?= <johan.sellstrom@iproov.com>
+Date: Fri, 2 Oct 2026 09:03:21 +0000
+Subject: [PATCH] fixup: NFCIsoDepReader build fixes
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../bindings/core/v8/active_script_wrappable_creation_key.h     | 1 +
+ third_party/blink/renderer/modules/nfc/nfc_iso_dep_tag.cc       | 2 ++
+ 2 files changed, 3 insertions(+)
+
+diff --git a/third_party/blink/renderer/bindings/core/v8/active_script_wrappable_creation_key.h b/third_party/blink/renderer/bindings/core/v8/active_script_wrappable_creation_key.h
+index 1e33f12ab5..ff5b401389 100644
+--- a/third_party/blink/renderer/bindings/core/v8/active_script_wrappable_creation_key.h
++++ b/third_party/blink/renderer/bindings/core/v8/active_script_wrappable_creation_key.h
+@@ -78,6 +78,7 @@ class ActiveScriptWrappableCreationKey final {
+   friend class MutationObserver;
+   friend class NavigatorManagedData;
+   friend class NDEFReader;
++  friend class NFCIsoDepReader;
+   friend class NetworkInformation;
+   friend class Notification;
+   friend class PaymentRequest;
+diff --git a/third_party/blink/renderer/modules/nfc/nfc_iso_dep_tag.cc b/third_party/blink/renderer/modules/nfc/nfc_iso_dep_tag.cc
+index 7746959723..7af37fc3f8 100644
+--- a/third_party/blink/renderer/modules/nfc/nfc_iso_dep_tag.cc
++++ b/third_party/blink/renderer/modules/nfc/nfc_iso_dep_tag.cc
+@@ -6,6 +6,8 @@
+ 
+ #include <utility>
+ 
++#include "base/task/single_thread_task_runner.h"
++
+ #include "third_party/blink/renderer/core/execution_context/execution_context.h"
+ #include "third_party/blink/renderer/core/typed_arrays/dom_array_piece.h"
+ #include "third_party/blink/renderer/platform/bindings/exception_state.h"
+-- 
+2.43.0
+
