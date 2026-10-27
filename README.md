@@ -12,9 +12,8 @@ browser enforcing that restriction.
 | | |
 |---|---|
 | **Status** | Proposal for discussion; working Chromium prototype on Android behind a flag |
-| **Spec draft** | Proposed addition to the Web NFC Community Group report: TODO(link) |
-| **Demo video** | TODO(link) |
-| **Discussion** | [Issues](../../issues) · TPAC 2026 breakout: TODO(link) |
+| **Spec draft** | Proposed addition to the Web NFC Community Group report: [`spec/`](spec/) |
+| **Discussion** | [Issues](../../issues) · TPAC 2026 breakout (proposed) |
 | **Editor** | Johan Sellström ([iProov](https://www.iproov.com/)) |
 
 ## Contents
@@ -198,9 +197,10 @@ high-assurance proofing; Digital Credentials serves presentation.
 
 You need an Android phone with NFC (Android 10 or later) and a passport or ID card with a chip.
 
-1. Install the prototype browser: [ChromePublic.apk](https://storage.googleapis.com/lab-mcp-johan-webnfc/ChromePublic.apk).
+1. Install the prototype browser: [ChromePublic.apk](https://github.com/johan-sellstrom/web-nfc-iso-dep/releases/latest/download/ChromePublic.apk)
+   (about 510 MB; SHA-256 in the [release notes](https://github.com/johan-sellstrom/web-nfc-iso-dep/releases/latest)).
    It installs next to Chrome as "Chromium" and has `NFCIsoDepReader` enabled.
-2. Open the demo page in it: TODO(link to the hosted `demo/`).
+2. Open the demo page in it: <https://johan-sellstrom.github.io/web-nfc-iso-dep/demo/>.
 3. Tap **Scan**, allow NFC, and hold the document to the phone. The demo selects the eMRTD
    application, reads `EF.CardAccess`, and shows the browser refusing payment-card commands.
 
@@ -237,6 +237,7 @@ checkout (see [`chromium/README.md`](chromium/README.md)) and build `chrome_publ
 | `spec/` | The proposed addition to the Web NFC CG report (also sent as a pull request) |
 | `chromium/` | Prototype patches for Chromium (Android), with build notes |
 | `demo/` | The demo page |
+| `LICENSE`, `LICENSE-docs` | BSD 3-Clause (code), CC BY 4.0 (documents) |
 
 ## Contributing
 
@@ -246,5 +247,7 @@ Community Contributor License Agreement.
 
 ## Licence
 
-TODO: confirm before publishing. Suggested: documents under CC BY 4.0; code and Chromium
-patches under the BSD 3-Clause licence, matching Chromium.
+Documents (this explainer and `spec/`) are licensed under [CC BY 4.0](LICENSE-docs). Code
+(the Chromium patches and the demo page) is licensed under the [BSD 3-Clause licence](LICENSE),
+matching Chromium. Contributions to the Web NFC specification itself are made under the W3C
+Community Contributor License Agreement.
