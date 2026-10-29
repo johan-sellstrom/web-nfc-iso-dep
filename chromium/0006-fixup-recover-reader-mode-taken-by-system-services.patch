@@ -1,0 +1,176 @@
+From 93edd977511f5cd081e2135c2ea9d65153c0e0fd Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Johan=20Sellstr=C3=B6m?= <johan.sellstrom@iproov.com>
+Date: Thu, 29 Oct 2026 10:23:58 +0000
+Subject: [PATCH] fixup: recover reader mode taken by system services while
+ waiting for an eMRTD
+
+Seen on a Galaxy Z Fold3 (Android 15): a Samsung system service
+(com.sec.app.RilErrorNotifier) takes NFC reader mode for about 3 s every
+two minutes. When it releases it, NfcService restores the platform's
+default polling (restoreSavedTech), silently dropping Chromium's reader
+mode. Android has no callback or query for this, so the page's scan()
+stayed pending while the phone dispatched the passport to the system.
+
+While only eMRTD readers are active, re-apply reader mode every 2 s
+when no session is live and no tag is being classified. A session whose
+transceive failed with a lost tag counts as not live, so the page's
+retry finds the document again. After a tag that is not an identity
+document, wait 10 s before re-applying, so a bank card left on the phone
+is not re-read every cycle.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../chromium/device/nfc/IsoDepSession.java    | 10 +++
+ .../src/org/chromium/device/nfc/NfcImpl.java  | 64 +++++++++++++++++++
+ 2 files changed, 74 insertions(+)
+
+diff --git a/services/device/nfc/android/java/src/org/chromium/device/nfc/IsoDepSession.java b/services/device/nfc/android/java/src/org/chromium/device/nfc/IsoDepSession.java
+index 98449cb..8ebbde6 100644
+--- a/services/device/nfc/android/java/src/org/chromium/device/nfc/IsoDepSession.java
++++ b/services/device/nfc/android/java/src/org/chromium/device/nfc/IsoDepSession.java
+@@ -33,6 +33,9 @@ class IsoDepSession implements NfcIsoDepTag {
+     private final Runnable mOnClosed;
+     private boolean mClosed;
+ 
++    /** Set once a transceive fails because the chip left the field; written off the UI thread. */
++    private volatile boolean mTagLost;
++
+     IsoDepSession(IsoDep isoDep, SequencedTaskRunner taskRunner, Runnable onClosed) {
+         mIsoDep = isoDep;
+         mTaskRunner = taskRunner;
+@@ -65,8 +68,10 @@ class IsoDepSession implements NfcIsoDepTag {
+                     try {
+                         response = mIsoDep.transceive(command);
+                     } catch (TagLostException e) {
++                        mTagLost = true;
+                         error = createError(NdefErrorType.IO_ERROR, "The tag was lost.");
+                     } catch (IOException | IllegalStateException | SecurityException e) {
++                        mTagLost = true;
+                         Log.w(TAG, "transceive failed: " + e.getMessage());
+                         error =
+                                 createError(
+@@ -81,6 +86,11 @@ class IsoDepSession implements NfcIsoDepTag {
+                 });
+     }
+ 
++    /** True if the chip is known to be gone, so the session can no longer reach it. */
++    boolean isTagLost() {
++        return mTagLost;
++    }
++
+     /** Ends the session. Called when the page drops the pipe or the browser cancels the scan. */
+     @Override
+     public void close() {
+diff --git a/services/device/nfc/android/java/src/org/chromium/device/nfc/NfcImpl.java b/services/device/nfc/android/java/src/org/chromium/device/nfc/NfcImpl.java
+index 9fb7b25..8eecfb2 100644
+--- a/services/device/nfc/android/java/src/org/chromium/device/nfc/NfcImpl.java
++++ b/services/device/nfc/android/java/src/org/chromium/device/nfc/NfcImpl.java
+@@ -128,6 +128,25 @@ public class NfcImpl implements Nfc {
+     /** Presence-check interval while only eMRTD readers are active. */
+     private static final int ISO_DEP_PRESENCE_CHECK_MS = 1000;
+ 
++    /**
++     * How often reader mode is re-applied while an eMRTD reader waits for a document. Some
++     * system services take reader mode briefly and, on release, restore the platform's default
++     * polling, which silently drops ours; Android has no callback or query for this.
++     */
++    private static final long READER_MODE_REASSERT_MS = 2000;
++
++    /** Back-off after a tag that is not an identity document, so it is not re-read every cycle. */
++    private static final long READER_MODE_REASSERT_AFTER_OTHER_TAG_MS = 10000;
++
++    /** Whether the reader-mode watchdog is scheduled. */
++    private boolean mReaderModeWatchdogScheduled;
++
++    /** Whether a discovered ISO-DEP tag is being classified on the I/O runner. */
++    private boolean mIsoDepClassifying;
++
++    /** Earliest time (System.currentTimeMillis) at which reader mode may be re-applied. */
++    private long mReaderModeReassertNotBeforeMs;
++
+     /** Runs blocking ISO-DEP I/O (classification and transceive) in order, off the UI thread. */
+     private final SequencedTaskRunner mIsoDepTaskRunner =
+             PostTask.createSequencedTaskRunner(TaskTraits.USER_BLOCKING_MAY_BLOCK);
+@@ -538,6 +557,13 @@ public class NfcImpl implements Nfc {
+ 
+         mReaderCallbackHandler = new ReaderCallbackHandler(this);
+         mReaderModeIsoDepOnly = isIsoDepOnly();
++        applyReaderMode();
++        if (mReaderModeIsoDepOnly) scheduleReaderModeWatchdog();
++    }
++
++    /** Calls NfcAdapter#enableReaderMode with the configuration for the current operations. */
++    @RequiresNonNull({"mActivity", "mNfcAdapter", "mReaderCallbackHandler"})
++    private void applyReaderMode() {
+         Bundle extras = null;
+         int flags =
+                 NfcAdapter.FLAG_READER_NFC_A
+@@ -562,6 +588,37 @@ public class NfcImpl implements Nfc {
+         mNfcAdapter.enableReaderMode(mActivity, mReaderCallbackHandler, flags, extras);
+     }
+ 
++    private void scheduleReaderModeWatchdog() {
++        if (mReaderModeWatchdogScheduled) return;
++        mReaderModeWatchdogScheduled = true;
++        PostTask.postDelayedTask(
++                TaskTraits.UI_DEFAULT, this::onReaderModeWatchdog, READER_MODE_REASSERT_MS);
++    }
++
++    /**
++     * Re-applies reader mode while an eMRTD reader is waiting for a document, so that losing it to
++     * another reader-mode user recovers without the page starting a new scan. Never runs during a
++     * live session or classification: re-applying restarts polling, which drops a connected tag.
++     */
++    private void onReaderModeWatchdog() {
++        mReaderModeWatchdogScheduled = false;
++        if (mOperationsSuspended
++                || mReaderCallbackHandler == null
++                || !mReaderModeIsoDepOnly
++                || mActivity == null
++                || mNfcAdapter == null) {
++            return;
++        }
++        boolean sessionLive = mIsoDepSession != null && !mIsoDepSession.isTagLost();
++        if (!sessionLive
++                && !mIsoDepClassifying
++                && System.currentTimeMillis() >= mReaderModeReassertNotBeforeMs) {
++            Log.i(TAG, "Re-applying reader mode while waiting for an identity document.");
++            applyReaderMode();
++        }
++        scheduleReaderModeWatchdog();
++    }
++
+     /** True if the only active operations are ISO-DEP (eMRTD) watches. */
+     private boolean isIsoDepOnly() {
+         return !mIsoDepWatchIds.isEmpty()
+@@ -812,6 +869,7 @@ public class NfcImpl implements Nfc {
+             mVibrator.vibrate(200);
+         }
+         mTagDiscoveredLastTimeMs = now;
++        mReaderModeReassertNotBeforeMs = now + READER_MODE_REASSERT_MS;
+ 
+         if (maybeHandleIsoDepTag(tag)) {
+             // A tag without NDEF support was taken by the ISO-DEP path; don't report it to NDEF
+@@ -833,6 +891,7 @@ public class NfcImpl implements Nfc {
+ 
+         // A new tag replaces any previous session.
+         closeIsoDepSession();
++        mIsoDepClassifying = true;
+         mIsoDepTaskRunner.execute(
+                 () -> {
+                     boolean isEmrtd = false;
+@@ -862,6 +921,11 @@ public class NfcImpl implements Nfc {
+ 
+     /** Hands a classified eMRTD tag to the most recent ISO-DEP watcher, or reports an error. */
+     private void onIsoDepTagClassified(IsoDep isoDep, boolean isEmrtd) {
++        mIsoDepClassifying = false;
++        if (!isEmrtd) {
++            mReaderModeReassertNotBeforeMs =
++                    System.currentTimeMillis() + READER_MODE_REASSERT_AFTER_OTHER_TAG_MS;
++        }
+         if (mClient == null || mIsoDepWatchIds.isEmpty() || mOperationsSuspended) {
+             if (isEmrtd) {
+                 try {
+-- 
+2.54.0 (Apple Git-157)
+

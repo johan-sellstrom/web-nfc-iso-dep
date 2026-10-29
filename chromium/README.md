@@ -9,6 +9,7 @@ These are prototype patches for discussion, not yet a reviewable CL series.
 | `0002` | Build fixes |
 | `0003` | Allow `GET RESPONSE` (response chaining); 30 s ISO-DEP timeout for slow chips |
 | `0005` | Passport-friendly reader mode while only ISO-DEP readers are active: NFC-A/B, `FLAG_READER_SKIP_NDEF_CHECK`, 1 s presence-check delay |
+| `0006` | Recover reader mode that a system service took and released (seen on Samsung): re-applied every 2 s while an eMRTD reader waits, never during a live session |
 
 There is no `0004` in this directory: it was a demo-only change that turned the feature on by
 default.
